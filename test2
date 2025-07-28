@@ -1,0 +1,239 @@
+import os
+import gzip
+import re
+import sys
+import datetime
+import concurrent.futures  # Import for parallel processing
+from typing import Tuple  # Added for Python <3.9 compatibility
+
+# Define PII patterns as a dictionary of compiled regex objects.
+# The order here determines the order of checking. If a line contains multiple
+# PII types, all will be identified.
+PII_PATTERNS = {
+    # Existing Regex Patterns for specific data formats
+    "DL_REGEX": re.compile(r'[A-Z]{2}[0-9]{2}[\-\s]?[0-9]{4}[0-9]{7}'),
+    "GSTIN_REGEX": re.compile(r'[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]'),
+    "IP_REGEX": re.compile(r'([0-9]{1,3}\.){3}[0-9]{1,3}'),
+    "MAC_REGEX": re.compile(r'([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})'),
+    "COORD_REGEX": re.compile(r'-?[0-9]{1,3}\.[0-9]+,\s*-?[0-9]{1,3}\.[0-9]+'),
+    "EMAIL_REGEX": re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'),
+    "MOBILE_REGEX": re.compile(r'(\+91|91|0)?[6-9][0-9]{9}'),
+    "PAN_REGEX": re.compile(r'[A-Z]{5}[0-9]{4}[A-Z]'),
+    # UPI regex: Removed ^ and $ anchors to allow matching within a larger string.
+    # This pattern matches "username@bankname" format without dots in the domain.
+    "UPI_REGEX": re.compile(r'[A-Za-z0-9]+@[A-Za-z]+'),
+    "VOTERID_REGEX": re.compile(r'[A-Z]{3}[0-9]{7}'),
+    "CARD_REGEX": re.compile(r'4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|2(?:2[2-9][0-9]{12}|[3-6][0-9]{13}|7(?:[01][0-9]{12}|20[0-9]{12}))|3[47][0-9]{13}|60[0-9]{14}|65[0-9]{14}|81[0-9]{14}|508[0-9][0-9]{12}'),
+
+    # New Keyword-based Regex Patterns (converted from previous filename heuristics)
+    # These patterns use word boundaries (\b) and are case-insensitive (re.IGNORECASE)
+    # to find common PII-related keywords within the line content.
+    "ADDRESS_KEYWORD": re.compile(r'\b(address|full address|complete address|residential address|permanent address|locality|pincode|postal code|zip|zip code|city|state|add)\b', re.IGNORECASE),
+    "NAME_KEYWORD": re.compile(r'\b(name|nam)\b', re.IGNORECASE),
+    "DOB_KEYWORD": re.compile(r'\b(date of birth|dob|birthdate|born on)\b', re.IGNORECASE),
+    "ACCOUNT_NUMBER_KEYWORD": re.compile(r'\b(account number|acc number|bank account|account no|a/c no)\b', re.IGNORECASE),
+    "CUSTOMER_ID_KEYWORD": re.compile(r'\b(customer id|cust id|customer number|cust)\b', re.IGNORECASE),
+    "SENSITIVE_HINTS_KEYWORD": re.compile(r'\b(national id|identity card|proof of identity|document number)\b', re.IGNORECASE),
+    "INSURANCE_POLICY_KEYWORD": re.compile(r'\b(insurance number|policy number|insurance id|ins id)\b', re.IGNORECASE)
+}
+
+# Global counters for overall statistics
+# These will now be summed up from results returned by parallel tasks
+total_files_parsed = 0
+total_lines_parsed = 0
+total_lines_with_pii = 0
+
+def process_gz_file(gz_file_path: str, output_dir: str) -> Tuple[int, int, int]:
+    """
+    Processes a single .gz file, scans its content line by line for PII patterns
+    (both specific regex and general keyword matches), and writes lines containing
+    PII to a new output file.
+
+    Args:
+        gz_file_path (str): The full path to the .gz file to be processed.
+        output_dir (str): The destination directory where the processed output
+                          file will be saved. This now includes the mirrored subdirectory path.
+
+    Returns:
+        Tuple[int, int, int]: A tuple containing:
+                         - 1 (representing one file processed).
+                         - The number of lines processed in the current .gz file.
+                         - The number of lines found to contain PII in the current .gz file.
+    """
+    file_lines_processed = 0
+    file_lines_with_pii = 0
+
+    # Ensure the output directory for this specific file (including its subpath) exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Construct the output file name (e.g., 'log.gz' -> 'log.txt')
+    output_file_name = os.path.basename(gz_file_path).replace('.gz', '.txt')
+    output_file_path = os.path.join(output_dir, output_file_name)
+
+    try:
+        # Open the .gz file in text mode ('rt') for reading, specifying UTF-8 encoding.
+        # 'errors=ignore' will skip characters that cannot be decoded.
+        with gzip.open(gz_file_path, 'rt', encoding='utf-8', errors='ignore') as infile:
+            # Open the output file in write mode ('w'), also with UTF-8 encoding.
+            with open(output_file_path, 'w', encoding='utf-8') as outfile:
+                for line_num, line in enumerate(infile, 1):
+                    file_lines_processed += 1
+
+                    # Remove leading/trailing whitespace and newline characters
+                    clean_line = line.strip()
+
+                    found_pii_in_line = False
+                    current_line_matches = []  # To store all PII regex matches found in the current line
+
+                    # Iterate through each defined PII regex pattern (now including keyword patterns)
+                    for pii_type, pattern in PII_PATTERNS.items():
+                        # Use finditer to find all non-overlapping matches of the pattern in the line
+                        for match in pattern.finditer(clean_line):
+                            matched_value = match.group(0)  # Get the exact matched string
+                            current_line_matches.append((matched_value, pii_type))
+                            found_pii_in_line = True
+
+                    # A line is considered to contain PII if any regex (including keyword regex) matches.
+                    if found_pii_in_line:
+                        file_lines_with_pii += 1
+
+                        # Start with the clean line content
+                        output_parts = [clean_line]
+
+                        # Add all regex matches found in the current line
+                        for matched_value, pii_type in current_line_matches:
+                            output_parts.append(matched_value)
+                            output_parts.append(pii_type)
+
+                        # Join parts with a semicolon and write to the output file, followed by a newline
+                        outfile.write(';'.join(output_parts) + '\n')
+
+    except FileNotFoundError:
+        print(f"Error: The file '{gz_file_path}' was not found. Skipping.", file=sys.stderr)
+        return 0, 0, 0  # Return zeros if file not found
+    except gzip.BadGzipFile:
+        print(f"Error: '{gz_file_path}' is not a valid gzip file. Skipping.", file=sys.stderr)
+        return 0, 0, 0  # Return zeros if bad gzip file
+    except Exception as e:
+        print(f"An unexpected error occurred while processing '{gz_file_path}': {e}", file=sys.stderr)
+        return 0, 0, 0  # Return zeros for other errors
+
+    return 1, file_lines_processed, file_lines_with_pii  # Return 1 for file processed, plus line counts
+
+def scan_for_pii_in_folder(input_folder_path: str):
+    """
+    Scans a given input folder for .gz files, processes each for PII,
+    and organizes the output in a new 'path_processed' directory,
+    mirroring the input subdirectory structure.
+    Finally, prints overall statistics of the scan and creates an indicator file.
+
+    Args:
+        input_folder_path (str): The path to the folder containing .gz files.
+    """
+    # Use local variables for counts within this function scope,
+    # then assign to global after summing up parallel results.
+    local_total_files_parsed = 0
+    local_total_lines_parsed = 0
+    local_total_lines_with_pii = 0
+
+    # Validate the input path
+    if not os.path.isdir(input_folder_path):
+        print(f"Error: Input path '{input_folder_path}' is not a valid directory.", file=sys.stderr)
+        return
+
+    # Extract the last folder name from the input path to use in the output structure
+    base_folder_name = os.path.basename(os.path.normpath(input_folder_path))
+
+    # Define the base output directory for all processed files
+    output_root_dir = "path_processed"
+    # Create the top-level output directory for this specific input folder
+    base_output_for_input_folder = os.path.join(output_root_dir, base_folder_name)
+
+    # Create the base output directory if it doesn't already exist
+    try:
+        os.makedirs(base_output_for_input_folder, exist_ok=True)
+        print(f"Output files will be saved to: {os.path.abspath(base_output_for_input_folder)} and its subdirectories.")
+    except OSError as e:
+        print(f"Error creating base output directory '{base_output_for_input_folder}': {e}", file=sys.stderr)
+        return
+
+    print(f"\nStarting PII scan in '{input_folder_path}'...")
+
+    gz_files_to_process = []
+    # Collect all .gz files and their corresponding output directories first
+    for root, _, files in os.walk(input_folder_path):
+        relative_path_from_input = os.path.relpath(root, input_folder_path)
+        current_output_dir = os.path.join(base_output_for_input_folder, relative_path_from_input)
+
+        for file_name in files:
+            if file_name.endswith('.gz'):
+                gz_file_path = os.path.join(root, file_name)
+                gz_files_to_process.append((gz_file_path, current_output_dir))
+
+    # Process files in parallel using ThreadPoolExecutor
+    # max_workers=3 means 3 files will be processed concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        # Submit tasks to the executor
+        future_to_file = {executor.submit(process_gz_file, gz_file_path, output_dir): gz_file_path for gz_file_path, output_dir in gz_files_to_process}
+
+        for future in concurrent.futures.as_completed(future_to_file):
+            gz_file_path = future_to_file[future]
+            try:
+                # Get results from the completed future
+                files_processed_count, lines_processed_count, lines_with_pii_count = future.result()
+                local_total_files_parsed += files_processed_count
+                local_total_lines_parsed += lines_processed_count
+                local_total_lines_with_pii += lines_with_pii_count
+                print(f"  Finished processing: {gz_file_path}")
+            except Exception as exc:
+                print(f"  '{gz_file_path}' generated an exception: {exc}", file=sys.stderr)
+
+    # Assign local totals to global counters after all parallel tasks are done
+    global total_files_parsed, total_lines_parsed, total_lines_with_pii
+    total_files_parsed = local_total_files_parsed
+    total_lines_parsed = local_total_lines_parsed
+    total_lines_with_pii = local_total_lines_with_pii
+
+    # Prepare the summary string
+    summary_content = (
+        "--- PII Scan Summary ---\n"
+        f"Total files parsed: {total_files_parsed}\n"
+        f"Total lines parsed: {total_lines_parsed}\n"
+        f"Total lines containing PII: {total_lines_with_pii}\n"
+        "------------------------"
+    )
+
+    # Define the "ALL DONE" banner
+    all_done_banner = (
+        "\n"
+        "========================================\n"
+        "||             SCAN COMPLETE!         ||\n"
+        "||             ALL DONE!              ||\n"
+        "========================================\n"
+    )
+
+    # Print the summary to console
+    print(f"\n{summary_content}")
+    print(all_done_banner)  # Also print the banner to console
+
+    # Create indicator file and write summary + banner to it
+    indicator_file_name = f"{base_folder_name}_all_done.txt"
+    try:
+        with open(indicator_file_name, 'w') as f:
+            f.write(summary_content)  # Write the summary content to the file
+            f.write(all_done_banner)  # Append the banner to the file
+        print(f"\nIndicator file created: '{indicator_file_name}' in the current directory with scan summary and 'ALL DONE' banner.")
+    except Exception as e:
+        print(f"Error creating indicator file '{indicator_file_name}': {e}", file=sys.stderr)
+
+# Example Usage:
+# To run this script, save it as a .py file (e.g., pii_scanner.py).
+# Then, execute it from your terminal like this:
+# python pii_scanner.py /path/to/your/folder/with/gz_files
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python pii_scanner.py <path_to_folder_with_gz_files>")
+        print("Please provide the path to the folder containing .gz files as a command-line argument.")
+    else:
+        input_folder = sys.argv[1]
+        scan_for_pii_in_folder(input_folder)
