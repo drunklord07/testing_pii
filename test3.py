@@ -155,7 +155,7 @@ def scan_for_pii_in_folder(input_folder: str):
                 tasks.append((os.path.join(dirpath, f), outdir))
 
     local_f = local_l = local_p = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(process_gz_file, p, o): p for p, o in tasks}
         for fut in concurrent.futures.as_completed(futures):
             path = futures[fut]
