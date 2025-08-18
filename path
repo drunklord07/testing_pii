@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import argparse
 import concurrent.futures
 import hashlib
 import logging
@@ -10,13 +9,15 @@ import threading
 from collections import defaultdict
 from typing import Tuple, Optional, Dict, List
 
-# -------- Configuration ----------
-OUTPUT_DIR_NAME = "final_output"      # Flat output folder in the current working directory
-LOG_FILENAME_DEFAULT = "processing.log"  # Log file in the current working directory
+INPUT_ROOT = r"/ABSOLUTE/OR/RELATIVE/PATH/TO/YOUR_ROOT_FOLDER"  # <<< EDIT THIS PATH
+WORKERS = 4                                                     # <<< EDIT THIS COUNT
 
-# Detect timestamped lines at the start of the line: "YYYY-MM-DD HH:MM:SS,mmm"
+# Output folder and log live in the folder you RUN the script from (CWD)
+OUTPUT_DIR_NAME = "final_output"        # Flat output folder in CWD
+LOG_FILENAME = "processing.log"         # Log file in CWD
+
+# Detect timestamped lines at the start: "YYYY-MM-DD HH:MM:SS,mmm"
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},\d{3}")
-# ---------------------------------
 
 
 class Counters:
@@ -37,33 +38,31 @@ class Counters:
                 setattr(self, k, getattr(self, k) + v)
 
 
-def setup_logging(log_path: str, verbose: bool):
-    """Configure logging to file (+ console)."""
-    handlers = [logging.FileHandler(log_path, encoding="utf-8")]
-    handlers.append(logging.StreamHandler(sys.stdout if verbose else sys.stderr))
-
+def setup_logging(log_path: str):
+    """Configure logging to file + console (INFO)."""
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=handlers,
+        handlers=[
+            logging.FileHandler(log_path, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
     )
-    if not verbose:
-        # Keep console calmer while the file captures DEBUG
-        logging.getLogger().handlers[-1].setLevel(logging.INFO)
+    # Keep console less noisy; file captures DEBUG
+    logging.getLogger().handlers[-1].setLevel(logging.INFO)
 
 
 def posix_rel_dir(root_dir: str, file_path: str) -> str:
     """
     Return POSIX-style relative directory path (excluding the root folder name).
     Example:
-        root=/a/b/root, file=/a/b/root/middle/pii/app.txt
-        -> "middle/pii"
+        root=/a/b/root, file=/a/b/root/middle/pii/app.txt  ->  "middle/pii"
     """
     file_dir = os.path.dirname(os.path.abspath(file_path))
     rel = os.path.relpath(file_dir, os.path.abspath(root_dir))
     if rel == ".":
         return ""  # directly under root: no subfolders
-    return "/".join(rel.split(os.sep))  # forward slashes
+    return "/".join(rel.split(os.sep))  # normalize to forward slashes
 
 
 def uniquify_name(dest_dir: str, filename: str, disambig_key: str) -> Tuple[str, bool]:
@@ -113,7 +112,7 @@ def process_file(
             for line in fin:
                 lines_scanned += 1
                 if TS_RE.match(line):
-                    # Append subfolder path (root name excluded). You said no .txt directly under root.
+                    # Append subfolder path (root name excluded).
                     if rel_dir_posix:
                         nl = "\n" if line.endswith("\n") else ""
                         core = line[:-1] if nl else line
@@ -122,7 +121,7 @@ def process_file(
                             logs_modified += 1
                         fout.write(new_line)
                     else:
-                        # No subfolder (shouldn't happen per your note) -> write as-is
+                        # If any .txt are directly under root (you said there aren't), write as-is.
                         fout.write(line)
                 else:
                     fout.write(line)
@@ -168,18 +167,21 @@ def print_progress(done: int, total: int, width: int = 42):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Append relative directory path (excluding root name) to timestamped log lines in .txt files."
-    )
-    parser.add_argument("--input", "-i", required=True,
-                        help="ROOT folder to scan. (Put YOUR PATH here.) Its name will NOT be included in appended paths.")
-    parser.add_argument("--workers", "-w", type=int, default=4,
-                        help="Number of worker threads (IO-bound speedup). Default: 4")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Print detailed progress to console as well.")
-    args = parser.parse_args()
+    # Basic validation of top-of-file config
+    if not INPUT_ROOT or INPUT_ROOT.strip() == "" or INPUT_ROOT.startswith("/ABSOLUTE/OR/RELATIVE"):
+        print("ERROR: Please set INPUT_ROOT at the top of the script to your root folder path.", file=sys.stderr)
+        sys.exit(2)
 
-    root_dir = os.path.abspath(args.input)
+    try:
+        workers = int(WORKERS)
+    except Exception:
+        print("ERROR: WORKERS must be an integer.", file=sys.stderr)
+        sys.exit(2)
+    if workers <= 0:
+        print("ERROR: WORKERS must be >= 1.", file=sys.stderr)
+        sys.exit(2)
+
+    root_dir = os.path.abspath(INPUT_ROOT)
     if not os.path.isdir(root_dir):
         print(f"ERROR: Input path is not a directory: {root_dir}", file=sys.stderr)
         sys.exit(2)
@@ -188,17 +190,15 @@ def main():
     run_dir = os.getcwd()
     out_dir = os.path.join(run_dir, OUTPUT_DIR_NAME)
     os.makedirs(out_dir, exist_ok=True)
+    log_path = os.path.join(run_dir, LOG_FILENAME)
 
-    log_path = os.path.join(run_dir, LOG_FILENAME_DEFAULT)
-
-    # Set up logging
-    setup_logging(log_path, args.verbose)
+    setup_logging(log_path)
     logging.info("=== Run started ===")
     logging.info(f"Running from: {run_dir}")
     logging.info(f"Input root: {root_dir}")
     logging.info(f"Output directory (flat): {out_dir}")
     logging.info(f"Log file: {log_path}")
-    logging.info(f"Workers: {args.workers}")
+    logging.info(f"Workers: {workers}")
 
     counters = Counters()
 
@@ -213,7 +213,7 @@ def main():
         logging.info("=== Run finished (no files) ===")
         return
 
-    # Precompute duplicate basenames (same filename in different folders)
+    # Detect same-name files (duplicate basenames) before processing
     duplicates_by_name: Dict[str, List[str]] = defaultdict(list)
     for fp in file_list:
         base = os.path.basename(fp)
@@ -228,6 +228,7 @@ def main():
 
     logging.info(f"Found .txt files: {total_found}")
 
+    # Progress bar
     done_files = 0
     print_progress(done_files, total_found)
 
@@ -239,7 +240,7 @@ def main():
         )
 
     # IO-bound workload -> threads are ideal
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         future_map = {ex.submit(_work, fp): fp for fp in file_list}
         for fut in concurrent.futures.as_completed(future_map):
             src = future_map[fut]
@@ -267,7 +268,7 @@ def main():
                 done_files += 1
                 print_progress(done_files, total_found)
 
-    # Summary
+    # Summary (file + console)
     logging.info("=== Summary ===")
     logging.info(f"Total .txt files found:      {counters.total_txt_files_found}")
     logging.info(f"Total files processed:       {counters.total_files_processed}")
@@ -279,7 +280,6 @@ def main():
     # Explicit note about same-name files
     if duplicate_names:
         logging.info(f"Duplicate base filenames (same name in different folders): {len(duplicate_names)} unique names.")
-        # List them again succinctly
         for name, paths in duplicate_names.items():
             logging.info(f"  {name}: {len(paths)} occurrences")
     else:
@@ -305,3 +305,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+is this okay?
