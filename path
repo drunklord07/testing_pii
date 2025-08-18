@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# === EDIT THESE TWO LINES ===
+INPUT_ROOT = r"C:\Users\dhhgdh\Desktop\path_pro"   # root that holds your 13 subfolders (do NOT set this to the parent)
+WORKERS    = 4                                      # number of worker threads
+
+# =====================================================================
+# No changes needed below this line.
+# =====================================================================
+
 import concurrent.futures
 import hashlib
 import logging
@@ -9,34 +17,40 @@ import threading
 from collections import defaultdict
 from typing import Tuple, Optional, Dict, List
 
-INPUT_ROOT = r"/ABSOLUTE/OR/RELATIVE/PATH/TO/YOUR_ROOT_FOLDER"  # <<< EDIT THIS PATH
-WORKERS = 4                                                     # <<< EDIT THIS COUNT
-
 # Output folder and log live in the folder you RUN the script from (CWD)
 OUTPUT_DIR_NAME = "final_output"        # Flat output folder in CWD
-LOG_FILENAME = "processing.log"         # Log file in CWD
+LOG_FILENAME    = "processing.txt"      # Log file (TXT as requested)
 
 # Detect timestamped lines at the start: "YYYY-MM-DD HH:MM:SS,mmm"
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},\d{3}")
 
+# Skip these directories (plus any that start with '.')
+SKIP_DIR_NAMES = {
+    OUTPUT_DIR_NAME,
+    "$RECYCLE.BIN",
+    "System Volume Information",
+    "__pycache__",
+    ".git",
+}
 
 class Counters:
     """Thread-safe global counters."""
     def __init__(self):
         self.lock = threading.Lock()
         self.total_txt_files_found = 0
+        self.total_files_selected = 0
         self.total_files_processed = 0
         self.total_files_skipped = 0
+        self.total_files_skipped_duplicates = 0
+        self.total_dirs_skipped = 0
         self.total_lines_scanned = 0
         self.total_logs_modified = 0
-        self.filename_collisions = 0
         self.errors = 0
 
     def add(self, **kwargs):
         with self.lock:
             for k, v in kwargs.items():
                 setattr(self, k, getattr(self, k) + v)
-
 
 def setup_logging(log_path: str):
     """Configure logging to file + console (INFO)."""
@@ -51,56 +65,47 @@ def setup_logging(log_path: str):
     # Keep console less noisy; file captures DEBUG
     logging.getLogger().handlers[-1].setLevel(logging.INFO)
 
+def _normalize_slashes(p: str) -> str:
+    return "/".join(p.split(os.sep))
 
-def posix_rel_dir(root_dir: str, file_path: str) -> str:
+def posix_rel_dir_excluding_root(root_dir: str, file_path: str) -> str:
     """
-    Return POSIX-style relative directory path (excluding the root folder name).
+    Return POSIX-style relative directory path BELOW the given root (never includes root name).
     Example:
-        root=/a/b/root, file=/a/b/root/middle/pii/app.txt  ->  "middle/pii"
+        root=.../path_pro, file=.../path_pro/middle/pii/app.txt -> "middle/pii"
+    Extra guard: if for any reason relpath includes the root name as first segment, strip it.
     """
-    file_dir = os.path.dirname(os.path.abspath(file_path))
-    rel = os.path.relpath(file_dir, os.path.abspath(root_dir))
-    if rel == ".":
-        return ""  # directly under root: no subfolders
-    return "/".join(rel.split(os.sep))  # normalize to forward slashes
-
-
-def uniquify_name(dest_dir: str, filename: str, disambig_key: str) -> Tuple[str, bool]:
-    """
-    If filename exists in dest_dir, append a short hash derived from disambig_key.
-    Returns (final_path, collided_bool).
-    """
-    base, ext = os.path.splitext(filename)
-    candidate = os.path.join(dest_dir, filename)
-    if not os.path.exists(candidate):
-        return candidate, False
-    # collision -> deterministic short hash on path
-    h = hashlib.md5(disambig_key.encode("utf-8")).hexdigest()[:8]
-    new_name = f"{base}__{h}{ext}"
-    return os.path.join(dest_dir, new_name), True
-
+    root_abs   = os.path.abspath(root_dir)
+    root_name  = os.path.basename(root_abs.rstrip("\\/"))
+    file_dir   = os.path.dirname(os.path.abspath(file_path))
+    rel        = os.path.relpath(file_dir, root_abs)
+    rel_norm   = _normalize_slashes(rel)
+    if rel_norm == ".":
+        return ""  # directly under root
+    parts = [p for p in rel_norm.split("/") if p not in ("", ".")]
+    # Guard against accidental inclusion of root segment due to casing or bad input
+    if parts and parts[0].lower() == root_name.lower():
+        parts = parts[1:]
+    return "/".join(parts)
 
 def process_file(
     file_path: str,
     root_dir: str,
     out_dir: str,
     encoding: str = "utf-8",
-) -> Tuple[int, int, bool, Optional[str], str]:
+) -> Tuple[int, int, Optional[str], str]:
     """
     Process one .txt file.
 
     Returns:
         lines_scanned: int
-        logs_modified: int (timestamped lines appended with path)
-        collided: bool (filename collision handled)
+        logs_modified: int
         error_message_or_None: Optional[str]
         out_path_basename: str (final written filename)
     """
-    rel_dir_posix = posix_rel_dir(root_dir, file_path)
+    rel_dir_posix = posix_rel_dir_excluding_root(root_dir, file_path)
     filename = os.path.basename(file_path)
-    disambig_key = os.path.join(rel_dir_posix, filename)  # for deterministic suffix
-
-    out_path, collided = uniquify_name(out_dir, filename, disambig_key)
+    out_path = os.path.join(out_dir, filename)
 
     lines_scanned = 0
     logs_modified = 0
@@ -114,44 +119,50 @@ def process_file(
                 if TS_RE.match(line):
                     # Append subfolder path (root name excluded).
                     if rel_dir_posix:
-                        nl = "\n" if line.endswith("\n") else ""
-                        core = line[:-1] if nl else line
+                        # Handle both \n and \r\n gracefully
+                        core = line.rstrip("\r\n")
+                        nl = "\n" if line.endswith(("\n", "\r\n")) else ""
                         new_line = f"{core};{rel_dir_posix}{nl}"
                         if new_line != line:
                             logs_modified += 1
                         fout.write(new_line)
                     else:
-                        # If any .txt are directly under root (you said there aren't), write as-is.
+                        # If any .txt are directly under root, just write as-is.
                         fout.write(line)
                 else:
                     fout.write(line)
 
-        return lines_scanned, logs_modified, collided, None, os.path.basename(out_path)
+        return lines_scanned, logs_modified, None, os.path.basename(out_path)
 
     except Exception as e:
-        return lines_scanned, logs_modified, collided, f"{type(e).__name__}: {e}", ""
+        return lines_scanned, logs_modified, f"{type(e).__name__}: {e}", ""
 
-
-def iter_txt_files(root_dir: str, exclude_dir_abs: str) -> Tuple[int, list]:
+def iter_txt_files(root_dir: str, out_dir_abs: str, counters: Counters) -> List[str]:
     """
     Walk root_dir and collect .txt files. Exclude the output dir if it's inside root.
-
-    Returns:
-        total_found: int
-        file_list: list[str]
+    Also skip known system/hidden folders and log them.
     """
     files = []
     for cur_dir, subdirs, filenames in os.walk(root_dir):
-        cur_dir_abs = os.path.abspath(cur_dir)
-        # prune traversal into output folder if nested under root
-        if exclude_dir_abs and os.path.commonpath([cur_dir_abs, exclude_dir_abs]) == exclude_dir_abs:
-            subdirs[:] = []
-            continue
+        # prune folders
+        pruned = []
+        for d in list(subdirs):
+            full = os.path.join(cur_dir, d)
+            # skip our output or known system/hidden folders
+            name = os.path.basename(full)
+            if (out_dir_abs and os.path.commonpath([os.path.abspath(full), out_dir_abs]) == out_dir_abs) \
+               or name in SKIP_DIR_NAMES or name.startswith("."):
+                pruned.append(full)
+                subdirs.remove(d)
+        if pruned:
+            counters.add(total_dirs_skipped=len(pruned))
+            for p in pruned:
+                logging.info(f"Skipping folder: {p}")
+
         for fn in filenames:
             if fn.lower().endswith(".txt"):
                 files.append(os.path.join(cur_dir, fn))
-    return len(files), files
-
+    return files
 
 def print_progress(done: int, total: int, width: int = 42):
     """Simple in-place progress bar."""
@@ -165,10 +176,9 @@ def print_progress(done: int, total: int, width: int = 42):
     if done == total:
         sys.stdout.write("\n")
 
-
 def main():
     # Basic validation of top-of-file config
-    if not INPUT_ROOT or INPUT_ROOT.strip() == "" or INPUT_ROOT.startswith("/ABSOLUTE/OR/RELATIVE"):
+    if not INPUT_ROOT or INPUT_ROOT.strip() == "":
         print("ERROR: Please set INPUT_ROOT at the top of the script to your root folder path.", file=sys.stderr)
         sys.exit(2)
 
@@ -195,43 +205,71 @@ def main():
     setup_logging(log_path)
     logging.info("=== Run started ===")
     logging.info(f"Running from: {run_dir}")
-    logging.info(f"Input root: {root_dir}")
+    logging.info(f"Input root: {root_dir} (root name excluded from appended path)")
     logging.info(f"Output directory (flat): {out_dir}")
     logging.info(f"Log file: {log_path}")
     logging.info(f"Workers: {workers}")
 
     counters = Counters()
 
-    # Build file list; exclude output dir if it's nested under input
-    exclude_dir_abs = os.path.abspath(out_dir) if os.path.commonpath([out_dir, root_dir]) == os.path.abspath(root_dir) else ""
-    total_found, file_list = iter_txt_files(root_dir, exclude_dir_abs)
-    counters.add(total_txt_files_found=total_found)
+    out_dir_abs = os.path.abspath(out_dir) if os.path.commonpath([out_dir, root_dir]) == os.path.abspath(root_dir) else ""
+    file_list = iter_txt_files(root_dir, out_dir_abs, counters)
+    counters.add(total_txt_files_found=len(file_list))
 
-    if total_found == 0:
+    if counters.total_txt_files_found == 0:
         logging.warning("No .txt files found. Exiting.")
         print("No .txt files found in the input directory.", file=sys.stderr)
         logging.info("=== Run finished (no files) ===")
         return
 
-    # Detect same-name files (duplicate basenames) before processing
-    duplicates_by_name: Dict[str, List[str]] = defaultdict(list)
+    # Detect same-name files (duplicate basenames). We will KEEP the first occurrence, SKIP the rest.
+    by_name: Dict[str, List[str]] = defaultdict(list)
     for fp in file_list:
-        base = os.path.basename(fp)
-        rel_dir = posix_rel_dir(root_dir, fp) or "(directly under root)"
-        duplicates_by_name[base].append(rel_dir)
-    duplicate_names = {name: paths for name, paths in duplicates_by_name.items() if len(paths) > 1}
+        by_name[os.path.basename(fp)].append(fp)
 
-    if duplicate_names:
-        logging.info(f"Duplicate base filenames detected: {len(duplicate_names)} unique names will collide in a flat output.")
-        for name, paths in duplicate_names.items():
-            logging.info(f"  '{name}' appears {len(paths)} times in: {paths}")
+    # Build selected list and skipped duplicates list
+    selected_files: List[str] = []
+    skipped_duplicates: List[str] = []
+    kept_for_name: Dict[str, str] = {}
 
-    logging.info(f"Found .txt files: {total_found}")
+    for name, paths in by_name.items():
+        # Keep first (by current enumeration order), skip the rest
+        keep = paths[0]
+        kept_for_name[name] = keep
+        selected_files.append(keep)
+        if len(paths) > 1:
+            for dup in paths[1:]:
+                skipped_duplicates.append(dup)
 
-    # Progress bar
-    done_files = 0
-    print_progress(done_files, total_found)
+    counters.add(total_files_selected=len(selected_files),
+                 total_files_skipped_duplicates=len(skipped_duplicates),
+                 total_files_skipped=len(skipped_duplicates))
 
+    if skipped_duplicates:
+        logging.info(f"Duplicate base filenames detected: {len([n for n,p in by_name.items() if len(p)>1])} unique names.")
+        for dup in skipped_duplicates:
+            name = os.path.basename(dup)
+            kept = kept_for_name[name]
+            kept_rel = posix_rel_dir_excluding_root(root_dir, kept) or "(directly under root)"
+            dup_rel  = posix_rel_dir_excluding_root(root_dir, dup) or "(directly under root)"
+            logging.info(f"SKIP duplicate: '{name}' from '{dup_rel}'  (kept first occurrence from '{kept_rel}')")
+
+    logging.info(f"Found .txt files: {counters.total_txt_files_found}")
+    logging.info(f"Selected for processing (unique names): {counters.total_files_selected}")
+    if counters.total_files_skipped_duplicates:
+        logging.info(f"Files skipped due to same name: {counters.total_files_skipped_duplicates}")
+
+    # Progress bar will reflect ALL files (processed + duplicates skipped)
+    total_progress_units = counters.total_files_selected + counters.total_files_skipped_duplicates
+    done_units = 0
+    print_progress(done_units, total_progress_units)
+
+    # Simulate progress for duplicates skipped (so bar advances)
+    for _ in skipped_duplicates:
+        done_units += 1
+        print_progress(done_units, total_progress_units)
+
+    # Process only the selected (unique-name) files in parallel
     def _work(fp: str):
         return process_file(
             file_path=fp,
@@ -239,16 +277,12 @@ def main():
             out_dir=out_dir,
         )
 
-    # IO-bound workload -> threads are ideal
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        future_map = {ex.submit(_work, fp): fp for fp in file_list}
+        future_map = {ex.submit(_work, fp): fp for fp in selected_files}
         for fut in concurrent.futures.as_completed(future_map):
             src = future_map[fut]
             try:
-                lines_scanned, logs_modified, collided, err, out_basename = fut.result()
-                if collided:
-                    counters.add(filename_collisions=1)
-                    logging.info(f"Filename collision for '{os.path.basename(src)}' -> wrote '{out_basename}'")
+                lines_scanned, logs_modified, err, out_basename = fut.result()
                 if err:
                     counters.add(errors=1, total_files_skipped=1)
                     logging.error(f"Failed: {src} | {err}")
@@ -258,6 +292,7 @@ def main():
                         total_lines_scanned=lines_scanned,
                         total_logs_modified=logs_modified,
                     )
+                    # Per-file debug is in file log only (not noisy in console)
                     logging.debug(
                         f"Processed: {src} -> {out_basename} | lines={lines_scanned}, modified={logs_modified}"
                     )
@@ -265,43 +300,24 @@ def main():
                 counters.add(errors=1, total_files_skipped=1)
                 logging.exception(f"Unhandled error while processing {src}: {e}")
             finally:
-                done_files += 1
-                print_progress(done_files, total_found)
+                done_units += 1
+                print_progress(done_units, total_progress_units)
 
-    # Summary (file + console)
+    # Summary (ONLY in log file; console prints just a small line)
     logging.info("=== Summary ===")
-    logging.info(f"Total .txt files found:      {counters.total_txt_files_found}")
-    logging.info(f"Total files processed:       {counters.total_files_processed}")
-    logging.info(f"Total files skipped/errors:  {counters.total_files_skipped}")
-    logging.info(f"Filename collisions handled: {counters.filename_collisions}")
-    logging.info(f"Total lines scanned:         {counters.total_lines_scanned}")
-    logging.info(f"Total log lines modified:    {counters.total_logs_modified}")
-
-    # Explicit note about same-name files
-    if duplicate_names:
-        logging.info(f"Duplicate base filenames (same name in different folders): {len(duplicate_names)} unique names.")
-        for name, paths in duplicate_names.items():
-            logging.info(f"  {name}: {len(paths)} occurrences")
-    else:
-        logging.info("No duplicate base filenames detected.")
-
+    logging.info(f"Total .txt files found:            {counters.total_txt_files_found}")
+    logging.info(f"Total unique basenames selected:   {counters.total_files_selected}")
+    logging.info(f"Total files processed:             {counters.total_files_processed}")
+    logging.info(f"Total files skipped (all reasons): {counters.total_files_skipped}")
+    logging.info(f"  └─ Skipped due to same name:     {counters.total_files_skipped_duplicates}")
+    logging.info(f"Total directories skipped:         {counters.total_dirs_skipped}")
+    logging.info(f"Total lines scanned:               {counters.total_lines_scanned}")
+    logging.info(f"Total log lines modified:          {counters.total_logs_modified}")
+    logging.info(f"Errors:                            {counters.errors}")
     logging.info("=== Run finished ===")
 
-    # Console summary (brief)
-    print("\nDone.")
-    print(f"Files found:             {counters.total_txt_files_found}")
-    print(f"Processed:               {counters.total_files_processed}")
-    print(f"Skipped (errors):        {counters.total_files_skipped}")
-    print(f"Lines scanned:           {counters.total_lines_scanned}")
-    print(f"Logs modified:           {counters.total_logs_modified}")
-    print(f"Filename collisions:     {counters.filename_collisions}")
-    if duplicate_names:
-        print(f"Same-name files found:   YES ({len(duplicate_names)} unique filenames)")
-    else:
-        print("Same-name files found:   NO")
-    print(f"Output dir:              {out_dir}")
-    print(f"Log file:                {log_path}")
-
+    # Keep console minimal per your request
+    print("\nDone. See detailed results in:", log_path)
 
 if __name__ == "__main__":
     main()
