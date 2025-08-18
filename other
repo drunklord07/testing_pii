@@ -1,9 +1,11 @@
 import os
 import gzip
+import lzma
 import re
 import sys
 import io
 import zipfile
+import tarfile
 import concurrent.futures
 from typing import Tuple
 
@@ -123,68 +125,85 @@ def _scan_stream_to_outfile(stream_iter, outfile) -> Tuple[int,int]:
     return file_lines_processed, file_lines_with_pii
 
 def process_txt_file(txt_path: str, output_dir: str) -> Tuple[int,int,int]:
-    """
-    Process one .txt: scan for PII (incl. Aadhaar + validation),
-    write matches to a .txt in the mirrored output_dir.
-    """
     os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.basename(txt_path)
     out_name = (base_name[:-4] + '.txt') if base_name.endswith('.txt') else (base_name + '.txt')
     out_path = os.path.join(output_dir, out_name)
-
     with open(txt_path, 'r', encoding='utf-8', errors='ignore') as infile, \
          open(out_path, 'w', encoding='utf-8') as outfile:
         lc, pc = _scan_stream_to_outfile(infile, outfile)
-
     return 1, lc, pc
 
 def process_zx_file(zx_path: str, output_dir: str) -> Tuple[int,int,int]:
-    """
-    Process one .zx (treated as plain text): scan for PII and write matches.
-    """
     os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.basename(zx_path)
     out_name = (base_name[:-3] + '.txt') if base_name.endswith('.zx') else (base_name + '.txt')
     out_path = os.path.join(output_dir, out_name)
-
     with open(zx_path, 'r', encoding='utf-8', errors='ignore') as infile, \
          open(out_path, 'w', encoding='utf-8') as outfile:
         lc, pc = _scan_stream_to_outfile(infile, outfile)
+    return 1, lc, pc
 
+def process_xz_file(xz_path: str, output_dir: str) -> Tuple[int,int,int]:
+    os.makedirs(output_dir, exist_ok=True)
+    base_name = os.path.basename(xz_path)
+    out_name = (base_name[:-3] + '.txt') if base_name.endswith('.xz') else (base_name + '.txt')
+    out_path = os.path.join(output_dir, out_name)
+    with lzma.open(xz_path, 'rt', encoding='utf-8', errors='ignore') as infile, \
+         open(out_path, 'w', encoding='utf-8') as outfile:
+        lc, pc = _scan_stream_to_outfile(infile, outfile)
     return 1, lc, pc
 
 def process_zip_file(zip_path: str, output_dir: str) -> Tuple[int,int,int]:
-    """
-    Process one .zip: iterate entries, scan each as text (utf-8, errors='ignore'),
-    write each entry's matches to a separate .txt file.
-    """
     os.makedirs(output_dir, exist_ok=True)
     zip_base = os.path.basename(zip_path)
-
     file_lines_processed = 0
     file_lines_with_pii = 0
-
     with zipfile.ZipFile(zip_path, 'r') as zf:
         for info in zf.infolist():
             if info.is_dir():
                 continue
-            # Build output name: <zipname>__<entrypath>.txt (slashes replaced)
             member_safe = info.filename.replace('/', '__').replace('\\', '__')
             out_name = f"{zip_base}__{member_safe}.txt"
             out_path = os.path.join(output_dir, out_name)
-
             with zf.open(info, 'r') as raw, \
                  open(out_path, 'w', encoding='utf-8') as outfile:
                 text_stream = io.TextIOWrapper(raw, encoding='utf-8', errors='ignore')
                 lc, pc = _scan_stream_to_outfile(text_stream, outfile)
                 file_lines_processed += lc
                 file_lines_with_pii += pc
+    return 1, file_lines_processed, file_lines_with_pii
 
+def process_tar_xz_file(tar_xz_path: str, output_dir: str) -> Tuple[int,int,int]:
+    """
+    Process one .tar.xz archive: iterate members, scan each as text (utf-8, errors='ignore'),
+    write each member's matches to a separate .txt file.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    tar_base = os.path.basename(tar_xz_path)
+    file_lines_processed = 0
+    file_lines_with_pii = 0
+    # tarfile auto-detects compression with mode 'r:*'
+    with tarfile.open(tar_xz_path, 'r:*') as tf:
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            fobj = tf.extractfile(member)
+            if fobj is None:
+                continue
+            member_safe = member.name.replace('/', '__').replace('\\', '__')
+            out_name = f"{tar_base}__{member_safe}.txt"
+            out_path = os.path.join(output_dir, out_name)
+            with fobj, open(out_path, 'w', encoding='utf-8') as outfile:
+                text_stream = io.TextIOWrapper(fobj, encoding='utf-8', errors='ignore')
+                lc, pc = _scan_stream_to_outfile(text_stream, outfile)
+                file_lines_processed += lc
+                file_lines_with_pii += pc
     return 1, file_lines_processed, file_lines_with_pii
 
 def scan_for_pii_in_folder(input_folder: str):
     """
-    Walk the directory, process .txt, .zip, and .zx files in parallel,
+    Walk the directory, process .txt, .zip, .zx, .xz, and .tar.xz files in parallel,
     print a summary, and write an indicator file.
     """
     global total_files_parsed, total_lines_parsed, total_lines_with_pii
@@ -194,7 +213,6 @@ def scan_for_pii_in_folder(input_folder: str):
         return
 
     base = os.path.basename(os.path.normpath(input_folder))
-    # CHANGED: path_processed -> path_processed_new
     root_out = os.path.join("path_processed_new", base)
     os.makedirs(root_out, exist_ok=True)
     print(f"Output will be under: {os.path.abspath(root_out)}")
@@ -205,12 +223,17 @@ def scan_for_pii_in_folder(input_folder: str):
         outdir = os.path.join(root_out, rel)
         for f in files:
             fp = os.path.join(dirpath, f)
-            if f.endswith('.txt'):
+            # IMPORTANT: check .tar.xz before generic .xz
+            if f.endswith('.tar.xz'):
+                tasks.append(('tarxz', fp, outdir))
+            elif f.endswith('.txt'):
                 tasks.append(('txt', fp, outdir))
             elif f.endswith('.zip'):
                 tasks.append(('zip', fp, outdir))
             elif f.endswith('.zx'):
                 tasks.append(('zx', fp, outdir))
+            elif f.endswith('.xz'):
+                tasks.append(('xz', fp, outdir))
 
     local_f = local_l = local_p = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -220,6 +243,10 @@ def scan_for_pii_in_folder(input_folder: str):
                 future = executor.submit(process_txt_file, p, o)
             elif ftype == 'zip':
                 future = executor.submit(process_zip_file, p, o)
+            elif ftype == 'tarxz':
+                future = executor.submit(process_tar_xz_file, p, o)
+            elif ftype == 'xz':
+                future = executor.submit(process_xz_file, p, o)
             else:  # 'zx'
                 future = executor.submit(process_zx_file, p, o)
             future_to_path[future] = p
@@ -255,7 +282,6 @@ def scan_for_pii_in_folder(input_folder: str):
     print(f"\n{summary}")
     print(banner)
 
-    # Indicator file
     indicator = f"{base}_all_done.txt"
     try:
         with open(indicator, 'w', encoding='utf-8') as f:
@@ -266,6 +292,6 @@ def scan_for_pii_in_folder(input_folder: str):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python pii_scanner_txt_zip_zx.py <folder_with_txt_zip_zx_files>")
+        print("Usage: python pii_scanner_txt_zip_zx_xz_tarxz.py <folder_with_txt_zip_zx_xz_tarxz_files>")
     else:
         scan_for_pii_in_folder(sys.argv[1])
