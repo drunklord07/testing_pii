@@ -1,0 +1,48 @@
+import os
+from collections import defaultdict
+
+def write_tree_and_summary(root_dir, output_file, summary_file):
+    level1_counts = defaultdict(int)
+    level2_counts = defaultdict(int)
+
+    with open(output_file, 'w') as f:
+        for current_root, dirs, files in os.walk(root_dir):
+            rel_path = os.path.relpath(current_root, root_dir)
+            depth = rel_path.count(os.sep)
+            indent = ' ' * 4 * depth
+            folder_name = os.path.basename(current_root) if rel_path != '.' else os.path.basename(root_dir)
+            f.write(f"{indent}{folder_name}/\n")
+
+            for file in files:
+                subindent = ' ' * 4 * (depth + 1)
+                f.write(f"{subindent}{file}\n")
+
+            # Count files for level 1 and 2 folders
+            if depth == 1:
+                level1_counts[rel_path] += len(files)
+            elif depth == 2:
+                level2_counts[rel_path] += len(files)
+
+    # Write summary
+    with open(summary_file, 'w') as sf:
+        sf.write("== Level 1 Directory Summary ==\n")
+        for dir_name, count in sorted(level1_counts.items()):
+            sf.write(f"{dir_name} -> {count} files\n")
+
+        sf.write("\n== Level 2 Directory Summary ==\n")
+        for dir_name, count in sorted(level2_counts.items()):
+            sf.write(f"{dir_name} -> {count} files\n")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate directory tree and summary")
+    parser.add_argument("directory", help="Root directory to scan")
+    parser.add_argument("--tree_output", default="filesystem_tree.txt", help="Tree output file")
+    parser.add_argument("--summary_output", default="directory_summary.txt", help="Summary output file")
+    args = parser.parse_args()
+
+    print(f"Scanning: {args.directory}")
+    write_tree_and_summary(args.directory, args.tree_output, args.summary_output)
+    print(f"Tree saved to: {args.tree_output}")
+    print(f"Summary saved to: {args.summary_output}")
