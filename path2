@@ -1,12 +1,3 @@
-# coding: utf-8
-# === EDIT THESE TWO LINES ===
-INPUT_ROOT = r"C:\Users\dhhgdh\Desktop\path_pro"   # set this to the path of 'path_pro' (root folder to scan)
-WORKERS    = 4                                      # number of worker threads
-
-# =====================================================================
-# No changes needed below this line.
-# =====================================================================
-
 import concurrent.futures
 import logging
 import os
@@ -15,9 +6,12 @@ import threading
 from collections import defaultdict
 from typing import Tuple, Optional, Dict, List
 
-# Output folder and log live in the folder you RUN the script from (CWD)
-OUTPUT_DIR_NAME = "final_output"        # Flat output folder in CWD
-LOG_FILENAME    = "processing.txt"      # Log file (TXT as requested)
+INPUT_ROOT = r"C:\Users\dhhgdh\Desktop\path_pro"   # set this to the path of 'path_pro' (root folder to scan)
+WORKERS    = 4                                      # number of worker threads
+
+# Output and log live in the folder you RUN the script from (CWD)
+OUTPUT_DIR_NAME = "final_output"        # flat output folder in CWD
+LOG_FILENAME    = "processing.txt"      # TXT log (as requested)
 
 # Skip these directories (plus any that start with '.')
 SKIP_DIR_NAMES = {
@@ -28,6 +22,63 @@ SKIP_DIR_NAMES = {
     ".git",
 }
 
+# ---------- Utilities ----------
+def setup_logging(log_path: str):
+    """Log to file + console (INFO to console, DEBUG to file)."""
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_path, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    logging.getLogger().handlers[-1].setLevel(logging.INFO)
+
+def _normalize_slashes(p: str) -> str:
+    return "/".join(p.split(os.sep))
+
+def _is_subpath(path: str, ancestor: str) -> bool:
+    """True if path is inside ancestor (robust across drives)."""
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(ancestor)]) == os.path.abspath(ancestor)
+    except ValueError:
+        # Different drives on Windows -> not a subpath
+        return False
+
+def posix_rel_dir_excluding_root(root_dir: str, file_path: str) -> str:
+    """
+    Return POSIX-style relative directory path BELOW the given root (never includes root name).
+    Example: root=...\path_pro, file=...\path_pro\apps\1\2\x.txt -> "apps/1/2"
+    """
+    root_abs   = os.path.abspath(root_dir)
+    root_name  = os.path.basename(root_abs.rstrip("\\/"))
+    file_dir   = os.path.dirname(os.path.abspath(file_path))
+    rel        = os.path.relpath(file_dir, root_abs)
+    rel_norm   = _normalize_slashes(rel)
+    if rel_norm == ".":
+        return ""
+    parts = [p for p in rel_norm.split("/") if p not in ("", ".")]
+    if parts and parts[0].lower() == root_name.lower():
+        parts = parts[1:]
+    return "/".join(parts)
+
+def count_lines_fast(path: str) -> int:
+    """Fast, accurate line count (handles files without trailing newline)."""
+    total = 0
+    last = None
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            total += chunk.count(b"\n")
+            last = chunk[-1:]
+    if last and last != b"\n":
+        total += 1
+    return total
+
+# ---------- Counters ----------
 class Counters:
     """Thread-safe global counters."""
     def __init__(self):
@@ -44,64 +95,14 @@ class Counters:
 
         self.total_lines_scanned = 0           # processed files only
         self.total_lines_modified = 0          # processed files only
-        self.total_lines_skipped = 0           # lines in duplicate-skipped files (we count them)
+        self.total_lines_skipped = 0           # lines in duplicate-skipped files
 
     def add(self, **kwargs):
         with self.lock:
             for k, v in kwargs.items():
                 setattr(self, k, getattr(self, k) + v)
 
-def setup_logging(log_path: str):
-    """Configure logging to file + console (INFO)."""
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
-    # Keep console less noisy; file captures DEBUG
-    logging.getLogger().handlers[-1].setLevel(logging.INFO)
-
-def _normalize_slashes(p: str) -> str:
-    return "/".join(p.split(os.sep))
-
-def posix_rel_dir_excluding_root(root_dir: str, file_path: str) -> str:
-    """
-    Return POSIX-style relative directory path BELOW the given root (never includes root name).
-    Example:
-        root=.../path_pro, file=.../path_pro/apps/1/2/x.txt -> "apps/1/2"
-    Guard against accidental inclusion of root segment due to casing or odd relpath.
-    """
-    root_abs   = os.path.abspath(root_dir)
-    root_name  = os.path.basename(root_abs.rstrip("\\/"))
-    file_dir   = os.path.dirname(os.path.abspath(file_path))
-    rel        = os.path.relpath(file_dir, root_abs)
-    rel_norm   = _normalize_slashes(rel)
-    if rel_norm == ".":
-        return ""  # directly under root
-    parts = [p for p in rel_norm.split("/") if p not in ("", ".")]
-    if parts and parts[0].lower() == root_name.lower():
-        parts = parts[1:]
-    return "/".join(parts)
-
-def count_lines_fast(path: str) -> int:
-    """Fast, accurate line count (handles files without trailing newline)."""
-    total = 0
-    last_byte = None
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(1 << 20)  # 1 MiB
-            if not chunk:
-                break
-            total += chunk.count(b"\n")
-            last_byte = chunk[-1:]
-    # if file not empty and doesn't end with \n, add one last line
-    if last_byte and last_byte != b"\n":
-        total += 1
-    return total
-
+# ---------- Core ----------
 def process_file(
     file_path: str,
     root_dir: str,
@@ -125,17 +126,13 @@ def process_file(
 
             for line in fin:
                 lines_scanned += 1
-
-                # Preserve original newline style
-                nl = ""
+                # Preserve original newline (\r\n or \n or none)
                 if line.endswith("\r\n"):
-                    core = line[:-2]
-                    nl = "\r\n"
+                    core, nl = line[:-2], "\r\n"
                 elif line.endswith("\n"):
-                    core = line[:-1]
-                    nl = "\n"
+                    core, nl = line[:-1], "\n"
                 else:
-                    core = line
+                    core, nl = line, ""
 
                 if rel_dir_posix:
                     new_line = f"{core};{rel_dir_posix}{nl}"
@@ -143,7 +140,7 @@ def process_file(
                         lines_modified += 1
                     fout.write(new_line)
                 else:
-                    # If directly under root, write unchanged (and log later as UNCHANGED)
+                    # Directly under root => leave unchanged
                     fout.write(line)
 
         return lines_scanned, lines_modified, None, os.path.basename(out_path)
@@ -151,10 +148,12 @@ def process_file(
     except Exception as e:
         return lines_scanned, lines_modified, f"{type(e).__name__}: {e}", ""
 
-def iter_txt_files(root_dir: str, out_dir_abs: str, counters: Counters) -> List[str]:
+def iter_txt_files(root_dir: str, out_dir_abs: str, exclude_files: set, counters: Counters) -> List[str]:
     """
-    Walk root_dir and collect .txt files. Exclude the output dir if it's inside root.
-    Also skip known system/hidden folders and LOG them.
+    Walk root_dir and collect .txt files. Exclude:
+      - the output folder (if inside root),
+      - known system/hidden folders,
+      - any file in 'exclude_files' (e.g., processing.txt, this script).
     """
     files = []
     for cur_dir, subdirs, filenames in os.walk(root_dir):
@@ -163,8 +162,7 @@ def iter_txt_files(root_dir: str, out_dir_abs: str, counters: Counters) -> List[
         for d in list(subdirs):
             full = os.path.join(cur_dir, d)
             name = os.path.basename(full)
-            if (out_dir_abs and os.path.commonpath([os.path.abspath(full), out_dir_abs]) == out_dir_abs) \
-               or name in SKIP_DIR_NAMES or name.startswith("."):
+            if (_is_subpath(full, out_dir_abs) if out_dir_abs else False) or name in SKIP_DIR_NAMES or name.startswith("."):
                 pruned.append(full)
                 subdirs.remove(d)
         if pruned:
@@ -174,7 +172,11 @@ def iter_txt_files(root_dir: str, out_dir_abs: str, counters: Counters) -> List[
 
         for fn in filenames:
             if fn.lower().endswith(".txt"):
-                files.append(os.path.join(cur_dir, fn))
+                candidate = os.path.join(cur_dir, fn)
+                if os.path.abspath(candidate) in exclude_files:
+                    logging.info(f"[FILE-SKIP SELF] {candidate}")
+                    continue
+                files.append(candidate)
     return files
 
 def print_progress(done: int, total: int, width: int = 42):
@@ -190,18 +192,16 @@ def print_progress(done: int, total: int, width: int = 42):
         sys.stdout.write("\n")
 
 def main():
-    # Basic validation of top-of-file config
+    # Validate config
     if not INPUT_ROOT or INPUT_ROOT.strip() == "":
-        print("ERROR: Please set INPUT_ROOT at the top of the script to your root folder path.", file=sys.stderr)
+        print("ERROR: Please set INPUT_ROOT at the top of the script.", file=sys.stderr)
         sys.exit(2)
-
     try:
         workers = int(WORKERS)
+        if workers <= 0:
+            raise ValueError()
     except Exception:
-        print("ERROR: WORKERS must be an integer.", file=sys.stderr)
-        sys.exit(2)
-    if workers <= 0:
-        print("ERROR: WORKERS must be >= 1.", file=sys.stderr)
+        print("ERROR: WORKERS must be an integer >= 1.", file=sys.stderr)
         sys.exit(2)
 
     root_dir = os.path.abspath(INPUT_ROOT)
@@ -209,11 +209,24 @@ def main():
         print(f"ERROR: Input path is not a directory: {root_dir}", file=sys.stderr)
         sys.exit(2)
 
-    # Output + log are always in the folder you run the script from (CWD)
+    # Output + log are in the folder you run from
     run_dir = os.getcwd()
     out_dir = os.path.join(run_dir, OUTPUT_DIR_NAME)
     os.makedirs(out_dir, exist_ok=True)
     log_path = os.path.join(run_dir, LOG_FILENAME)
+
+    # Exclude our own files if they sit under root
+    exclude_files = set()
+    # (a) the log file
+    if _is_subpath(log_path, root_dir):
+        exclude_files.add(os.path.abspath(log_path))
+    # (b) this script file
+    try:
+        self_path = os.path.abspath(__file__)
+        if _is_subpath(self_path, root_dir):
+            exclude_files.add(self_path)
+    except NameError:
+        pass  # __file__ may be missing in some environments
 
     setup_logging(log_path)
     logging.info("=== Run started ===")
@@ -225,8 +238,10 @@ def main():
 
     counters = Counters()
 
-    out_dir_abs = os.path.abspath(out_dir) if os.path.commonpath([out_dir, root_dir]) == os.path.abspath(root_dir) else ""
-    file_list = iter_txt_files(root_dir, out_dir_abs, counters)
+    # If output dir sits inside root, remember its absolute path to prune traversal
+    out_dir_abs = os.path.abspath(out_dir) if _is_subpath(out_dir, root_dir) else ""
+
+    file_list = iter_txt_files(root_dir, out_dir_abs, exclude_files, counters)
     counters.add(total_txt_files_found=len(file_list))
 
     if counters.total_txt_files_found == 0:
@@ -235,7 +250,7 @@ def main():
         logging.info("=== Run finished (no files) ===")
         return
 
-    # Detect same-name files. KEEP the first (deterministic: choose lexicographically smallest full path), SKIP the rest.
+    # Deduplicate by basename (keep lexicographically first full path)
     by_name: Dict[str, List[str]] = defaultdict(list)
     for fp in file_list:
         by_name[os.path.basename(fp)].append(fp)
@@ -253,11 +268,13 @@ def main():
         if len(paths) > 1:
             skipped_duplicates.extend(paths[1:])
 
-    counters.add(total_files_selected=len(selected_files),
-                 total_files_skipped_duplicates=len(skipped_duplicates),
-                 total_files_skipped=len(skipped_duplicates))
+    counters.add(
+        total_files_selected=len(selected_files),
+        total_files_skipped_duplicates=len(skipped_duplicates),
+        total_files_skipped=len(skipped_duplicates),
+    )
 
-    # Pre-count lines for duplicate-skipped files (to report "lines skipped")
+    # Count lines in duplicate-skipped files (for "lines skipped")
     dup_details: Dict[str, Dict[str, int]] = defaultdict(dict)  # basename -> {rel_path: line_count}
     if skipped_duplicates:
         logging.info(f"=== Duplicate base filenames detected: {len([n for n,p in by_name.items() if len(p)>1])} unique names ===")
@@ -278,22 +295,23 @@ def main():
             if len(paths) > 1:
                 kept_rel = posix_rel_dir_excluding_root(root_dir, kept_fp) or "(directly under root)"
                 kept_key = f"{kept_rel}/{os.path.basename(kept_fp)}" if kept_rel != "(directly under root)" else os.path.basename(kept_fp)
-                logging.info(f"[DUP] Keep:   {kept_key}")
+                logging.info(f"[DUP] Keep: {kept_key}")
                 for p in paths[1:]:
                     rel = posix_rel_dir_excluding_root(root_dir, p) or "(directly under root)"
                     k = f"{rel}/{os.path.basename(p)}" if rel != "(directly under root)" else os.path.basename(p)
                     lines = dup_details[os.path.basename(p)].get(k, 0)
-                    logging.info(f"[DUP] Skip:   {k}  (lines={lines})")
+                    logging.info(f"[DUP] Skip: {k}  (lines={lines})")
 
     logging.info(f"Found .txt files: {counters.total_txt_files_found}")
     logging.info(f"Selected for processing (unique names): {counters.total_files_selected}")
     if counters.total_files_skipped_duplicates:
         logging.info(f"Files skipped due to same name: {counters.total_files_skipped_duplicates} (lines skipped={counters.total_lines_skipped})")
 
-    # Progress bar reflects ALL units (duplicates counted + processed files)
-    total_progress_units = counters.total_files_selected + counters.total_files_skipped_duplicates
-    done_units = counters.total_files_skipped_duplicates  # we've "done" the counting for duplicates already
-    print_progress(done_units, total_progress_units)
+    # Progress bar includes both duplicate "units" and processed files
+    total_units = counters.total_files_selected + counters.total_files_skipped_duplicates
+    done_units = counters.total_files_skipped_duplicates  # we've already "counted" the dup line totals
+    # draw initial bar
+    print_progress(done_units, total_units)
 
     # Track per-file status
     changed_files: List[str] = []
@@ -302,11 +320,7 @@ def main():
 
     # Process only the selected (unique-name) files in parallel
     def _work(fp: str):
-        return process_file(
-            file_path=fp,
-            root_dir=root_dir,
-            out_dir=out_dir,
-        )
+        return process_file(fp, root_dir, out_dir)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         future_map = {ex.submit(_work, fp): fp for fp in selected_files}
@@ -342,9 +356,9 @@ def main():
                 logging.exception(f"[FILE-ERROR] {rel_file} | {e}")
             finally:
                 done_units += 1
-                print_progress(done_units, total_progress_units)
+                print_progress(done_units, total_units)
 
-    # === Detailed Summary (printed to BOTH terminal and log) ===
+    # === Detailed Summary (both terminal and log) ===
     logging.info("=== Summary ===")
     logging.info(f"Total .txt files found:            {counters.total_txt_files_found}")
     logging.info(f"Total directories skipped:         {counters.total_dirs_skipped}")
@@ -358,7 +372,7 @@ def main():
     logging.info(f"Total lines modified (processed):  {counters.total_lines_modified}")
     logging.info(f"Total lines skipped (duplicates):  {counters.total_lines_skipped}")
 
-    # Duplicate names with details
+    # Duplicate names detail
     if counters.total_files_skipped_duplicates:
         logging.info("=== Duplicate names detail ===")
         dup_name_count = 0
@@ -394,6 +408,10 @@ def main():
                     rel = posix_rel_dir_excluding_root(root_dir, p) or "(directly under root)"
                     k = f"{rel}/{os.path.basename(p)}" if rel != "(directly under root)" else os.path.basename(p)
                     logging.info(k)
+    if counters.total_dirs_skipped:
+        logging.info("=== Folders skipped (system/hidden/output) ===")
+        # Each was already logged as [FOLDER-SKIP]
+
     if error_files:
         logging.info("=== Files with errors ===")
         for s in error_files:
