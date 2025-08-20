@@ -1,0 +1,408 @@
+import concurrent.futures
+import logging
+import os
+import re
+import sys
+import threading
+from collections import defaultdict
+from typing import Dict, List, Tuple, Optional, Set
+
+INPUT_ROOT = r"C:\Users\dhhgdh\Desktop\path_pro"   # full path of 'path_pro' (root folder to scan; root name is EXCLUDED in appended path)
+WORKERS    = 4                                      # number of worker threads
+
+OUTPUT_DIR_NAME = "final_output"        # flat output folder in CWD
+LOG_FILENAME    = "processing.txt"      # plain text log (in CWD)
+
+# Folders to skip (plus anything starting with '.')
+SKIP_DIR_NAMES = {
+    OUTPUT_DIR_NAME,
+    "$RECYCLE.BIN",
+    "System Volume Information",
+    "__pycache__",
+    ".git",
+}
+
+# ---------------- helpers ----------------
+
+def setup_logging(log_path: str) -> None:
+    """Log to file + console (INFO to console, DEBUG to file)."""
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_path, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    # keep console calmer; file still captures DEBUG
+    logging.getLogger().handlers[-1].setLevel(logging.INFO)
+
+def _normalize_slashes(p: str) -> str:
+    return "/".join(p.split(os.sep))
+
+def _is_subpath(path: str, ancestor: str) -> bool:
+    """True if path is inside ancestor; safe across drives."""
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(ancestor)]) == os.path.abspath(ancestor)
+    except Exception:
+        return False
+
+def rel_dir_below_root(root_dir: str, file_path: str) -> str:
+    """POSIX-style relative directory BELOW root (never includes root name)."""
+    root_abs = os.path.abspath(root_dir)
+    root_name = os.path.basename(root_abs.rstrip("\\/"))
+    file_dir = os.path.dirname(os.path.abspath(file_path))
+    rel = os.path.relpath(file_dir, root_abs)
+    rel_norm = _normalize_slashes(rel)
+    if rel_norm == ".":
+        return ""
+    parts = [p for p in rel_norm.split("/") if p not in ("", ".")]
+    if parts and parts[0].lower() == root_name.lower():
+        parts = parts[1:]
+    return "/".join(parts)
+
+def print_progress(done: int, total: int, width: int = 42) -> None:
+    """Simple progress bar."""
+    if total <= 0:
+        return
+    pct = done / total
+    filled = int(width * pct)
+    bar = "█" * filled + "-" * (width - filled)
+    sys.stdout.write(f"\rProcessing: |{bar}| {done}/{total} ({pct:.0%})")
+    sys.stdout.flush()
+    if done == total:
+        sys.stdout.write("\n")
+
+# ---------- name reservation for collisions (thread-safe) ----------
+
+_path_token_re = re.compile(r"[^A-Za-z0-9]+")
+
+def make_suffix_from_rel(rel_dir: str, max_parts: int = 6, max_len: int = 60) -> str:
+    """
+    Build a readable suffix from the relative directory: apps/1/2 -> 'apps_1_2'.
+    Keeps the LAST 'max_parts' path segments, normalizes to [A-Za-z0-9_], trims length.
+    """
+    if not rel_dir:
+        return "root"
+    parts = [p for p in rel_dir.split("/") if p]
+    parts = parts[-max_parts:]  # keep last N parts to avoid super-long names
+    raw = "_".join(parts)
+    norm = _path_token_re.sub("_", raw).strip("_")
+    if len(norm) > max_len:
+        norm = norm[-max_len:]  # keep tail (more specific)
+    return norm or "p"
+
+class NameAllocator:
+    """
+    Reserves unique output filenames in a flat directory.
+    On collision, appends __<path-based suffix> derived from the file's relative path (deterministic, human-readable).
+    """
+    def __init__(self, out_dir: str) -> None:
+        self.out_dir = out_dir
+        self.lock = threading.Lock()
+        # pre-populate with existing files in output dir (case-insensitive for Windows)
+        self.used: Set[str] = set(fn.lower() for fn in os.listdir(out_dir))
+
+    def reserve(self, base_filename: str, rel_dir_for_suffix: str) -> Tuple[str, bool]:
+        """
+        Returns (final_out_path, collided_bool).
+        """
+        with self.lock:
+            base_lower = base_filename.lower()
+            if base_lower not in self.used:
+                self.used.add(base_lower)
+                return os.path.join(self.out_dir, base_filename), False
+
+            base, ext = os.path.splitext(base_filename)
+            suffix = make_suffix_from_rel(rel_dir_for_suffix)
+            cand = f"{base}__{suffix}{ext}"
+            cand_lower = cand.lower()
+            if cand_lower not in self.used:
+                self.used.add(cand_lower)
+                return os.path.join(self.out_dir, cand), True
+
+            # If even that exists, add numeric bumpers
+            i = 2
+            while True:
+                cand2 = f"{base}__{suffix}_{i}{ext}"
+                cand2_lower = cand2.lower()
+                if cand2_lower not in self.used:
+                    self.used.add(cand2_lower)
+                    return os.path.join(self.out_dir, cand2), True
+                i += 1
+
+# ---------------- counters ----------------
+
+class Counters:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.total_txt_files_found = 0
+        self.total_dirs_skipped = 0
+
+        self.total_files_processed = 0
+        self.total_files_unchanged = 0
+        self.total_files_errors = 0
+
+        self.total_lines_scanned = 0
+        self.total_lines_modified = 0
+
+        self.filename_collisions_handled = 0
+        self.duplicate_basenames_unique = 0  # informational (how many names appeared >1)
+
+    def add(self, **kwargs) -> None:
+        with self.lock:
+            for k, v in kwargs.items():
+                setattr(self, k, getattr(self, k) + v)
+
+# ---------------- core work ----------------
+
+def process_file(file_path: str, root_dir: str, out_path: str) -> Tuple[int, int, Optional[str]]:
+    """
+    Append ;<subfolder/path> to EVERY line (including blank lines) and write to out_path.
+    Returns: (lines_scanned, lines_modified, error_or_None)
+    """
+    rel_dir_posix = rel_dir_below_root(root_dir, file_path)
+
+    lines_scanned = 0
+    lines_modified = 0
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as fin, \
+             open(out_path, "w", encoding="utf-8", errors="replace") as fout:
+
+            for line in fin:
+                lines_scanned += 1
+                # preserve newline style
+                if line.endswith("\r\n"):
+                    core, nl = line[:-2], "\r\n"
+                elif line.endswith("\n"):
+                    core, nl = line[:-1], "\n"
+                else:
+                    core, nl = line, ""
+
+                if rel_dir_posix:
+                    new_line = f"{core};{rel_dir_posix}{nl}"
+                    if new_line != line:
+                        lines_modified += 1
+                    fout.write(new_line)
+                else:
+                    # directly under root (you said none) -> unchanged
+                    fout.write(line)
+
+        return lines_scanned, lines_modified, None
+
+    except Exception as e:
+        return lines_scanned, lines_modified, f"{type(e).__name__}: {e}"
+
+def iter_txt_files(root_dir: str, out_dir_abs: str, exclude_files: Set[str], counters: Counters, skipped_folders_log: List[str]) -> List[str]:
+    """
+    Collect .txt files, skipping output/log/system/hidden folders and our own files.
+    Logs skipped folders into skipped_folders_log.
+    """
+    files: List[str] = []
+    for cur_dir, subdirs, filenames in os.walk(root_dir):
+        # prune folders
+        for d in list(subdirs):
+            full = os.path.join(cur_dir, d)
+            name = os.path.basename(full)
+            if (_is_subpath(full, out_dir_abs) if out_dir_abs else False) or name in SKIP_DIR_NAMES or name.startswith("."):
+                subdirs.remove(d)
+                skipped_folders_log.append(full)
+                counters.add(total_dirs_skipped=1)
+
+        for fn in filenames:
+            if fn.lower().endswith(".txt"):
+                candidate = os.path.join(cur_dir, fn)
+                if os.path.abspath(candidate) in exclude_files:
+                    logging.info(f"[FILE-SKIP SELF] {candidate}")
+                    continue
+                files.append(candidate)
+    return files
+
+# ---------------- main ----------------
+
+def main() -> None:
+    # Validate config
+    if not INPUT_ROOT or INPUT_ROOT.strip() == "":
+        print("ERROR: Please set INPUT_ROOT at the top of the script.", file=sys.stderr)
+        sys.exit(2)
+    try:
+        workers = int(WORKERS)
+        if workers <= 0:
+            raise ValueError()
+    except Exception:
+        print("ERROR: WORKERS must be an integer >= 1.", file=sys.stderr)
+        sys.exit(2)
+
+    root_dir = os.path.abspath(INPUT_ROOT)
+    if not os.path.isdir(root_dir):
+        print(f"ERROR: Input path is not a directory: {root_dir}", file=sys.stderr)
+        sys.exit(2)
+
+    # Output + log are in the folder you run from
+    run_dir = os.getcwd()
+    out_dir = os.path.join(run_dir, OUTPUT_DIR_NAME)
+    os.makedirs(out_dir, exist_ok=True)
+    log_path = os.path.join(run_dir, LOG_FILENAME)
+
+    # Exclude our own log/script if they live under the root
+    exclude_files: Set[str] = set()
+    if _is_subpath(log_path, root_dir):
+        exclude_files.add(os.path.abspath(log_path))
+    try:
+        self_path = os.path.abspath(__file__)
+        if _is_subpath(self_path, root_dir):
+            exclude_files.add(self_path)
+    except NameError:
+        pass
+
+    setup_logging(log_path)
+    logging.info("=== Run started ===")
+    logging.info(f"Running from: {run_dir}")
+    logging.info(f"Input root: {root_dir} (root name excluded from appended path)")
+    logging.info(f"Output directory (flat): {out_dir}")
+    logging.info(f"Log file: {log_path}")
+    logging.info(f"Workers: {workers}")
+
+    counters = Counters()
+    skipped_folders_log: List[str] = []
+
+    out_dir_abs = os.path.abspath(out_dir) if _is_subpath(out_dir, root_dir) else ""
+    file_list = iter_txt_files(root_dir, out_dir_abs, exclude_files, counters, skipped_folders_log)
+    counters.add(total_txt_files_found=len(file_list))
+
+    if counters.total_txt_files_found == 0:
+        logging.warning("No .txt files found. Exiting.")
+        print("No .txt files found in the input directory.", file=sys.stderr)
+        logging.info("=== Run finished (no files) ===")
+        return
+
+    # Duplicate basenames (for reporting only; we DO NOT skip)
+    by_name: Dict[str, List[str]] = defaultdict(list)
+    for fp in file_list:
+        by_name[os.path.basename(fp)].append(fp)
+    dup_unique = sum(1 for v in by_name.values() if len(v) > 1)
+    counters.add(duplicate_basenames_unique=dup_unique)
+
+    if dup_unique:
+        logging.info(f"=== Duplicate base filenames detected (informational): {dup_unique} unique names ===")
+        for name, paths in sorted(by_name.items()):
+            if len(paths) > 1:
+                paths_rel = []
+                for p in sorted(paths, key=lambda x: os.path.abspath(x).lower()):
+                    rel = rel_dir_below_root(root_dir, p) or "(directly under root)"
+                    paths_rel.append(f"{rel}/{os.path.basename(p)}" if rel != "(directly under root)" else os.path.basename(p))
+                logging.info(f"[DUP-NAME] {name} (occurrences={len(paths)})")
+                for pr in paths_rel:
+                    logging.info(f"  - {pr}")
+
+    # Prepare name allocator (thread-safe) for unique output basenames with PATH-BASED suffix
+    allocator = NameAllocator(out_dir)
+
+    # Progress across all files
+    total_units = counters.total_txt_files_found
+    done_units = 0
+    print_progress(done_units, total_units)
+
+    # Per-file tracking
+    changed_files: List[str] = []
+    unchanged_files: List[str] = []
+    error_files: List[str] = []
+    collisions_log: List[Tuple[str, str]] = []  # (src_rel_file, out_basename)
+
+    def _work(src_fp: str) -> Tuple[int, int, Optional[str], str, bool, str]:
+        """
+        Reserve a unique output name, process the file, return:
+        (lines_scanned, lines_modified, err, out_basename, collided, src_rel_display)
+        """
+        rel_dir = rel_dir_below_root(root_dir, src_fp) or "(directly under root)"
+        src_rel_display = f"{rel_dir}/{os.path.basename(src_fp)}" if rel_dir != "(directly under root)" else os.path.basename(src_fp)
+
+        # reserve output name (collision-safe) using PATH-BASED suffix
+        out_path, collided = allocator.reserve(os.path.basename(src_fp), rel_dir if rel_dir != "(directly under root)" else "")
+        lines_scanned, lines_modified, err = process_file(src_fp, root_dir, out_path)
+        return lines_scanned, lines_modified, err, os.path.basename(out_path), collided, src_rel_display
+
+    # Process files in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        future_map = {ex.submit(_work, fp): fp for fp in file_list}
+        for fut in concurrent.futures.as_completed(future_map):
+            src = future_map[fut]
+            try:
+                lines_scanned, lines_modified, err, out_basename, collided, src_rel_display = fut.result()
+                if collided:
+                    counters.add(filename_collisions_handled=1)
+                    collisions_log.append((src_rel_display, out_basename))
+                if err:
+                    counters.add(total_files_errors=1)
+                    error_files.append(src_rel_display)
+                    logging.error(f"[FILE-ERROR] {src_rel_display} | {err}")
+                else:
+                    counters.add(
+                        total_files_processed=1,
+                        total_lines_scanned=lines_scanned,
+                        total_lines_modified=lines_modified,
+                    )
+                    if lines_modified > 0:
+                        changed_files.append(f"{src_rel_display} | lines={lines_scanned}, modified={lines_modified} -> {out_basename}")
+                        logging.info(f"[CHANGED] {src_rel_display} | lines={lines_scanned}, modified={lines_modified} -> {out_basename}")
+                    else:
+                        counters.add(total_files_unchanged=1)
+                        unchanged_files.append(f"{src_rel_display} | lines={lines_scanned}, modified=0 -> {out_basename}")
+                        logging.info(f"[UNCHANGED] {src_rel_display} | lines={lines_scanned}, modified=0 -> {out_basename}")
+            except Exception as e:
+                counters.add(total_files_errors=1)
+                rel_dir = rel_dir_below_root(root_dir, src) or "(directly under root)"
+                src_rel_display = f"{rel_dir}/{os.path.basename(src)}" if rel_dir != "(directly under root)" else os.path.basename(src)
+                error_files.append(src_rel_display)
+                logging.exception(f"[FILE-ERROR] {src_rel_display} | {e}")
+            finally:
+                done_units += 1
+                print_progress(done_units, total_units)
+
+    # -------- Summary (both terminal and log) --------
+    logging.info("=== Summary ===")
+    logging.info(f"Total .txt files found:            {counters.total_txt_files_found}")
+    logging.info(f"Total directories skipped:         {counters.total_dirs_skipped}")
+    logging.info(f"Total files processed:             {counters.total_files_processed}")
+    logging.info(f"  └─ Files unchanged:              {counters.total_files_unchanged}")
+    logging.info(f"  └─ Files with errors:            {counters.total_files_errors}")
+    logging.info(f"Total lines scanned (processed):   {counters.total_lines_scanned}")
+    logging.info(f"Total lines modified (processed):  {counters.total_lines_modified}")
+    logging.info(f"Duplicate basenames (unique):      {counters.duplicate_basenames_unique}")
+    logging.info(f"Filename collisions handled:       {counters.filename_collisions_handled}")
+
+    if counters.duplicate_basenames_unique:
+        logging.info("=== Duplicate names were present (informational) ===")
+        logging.info("All were processed; collisions below show which outputs were renamed with path-based suffixes.")
+
+    if collisions_log:
+        logging.info("=== Output filename collisions resolved (path-based suffix) ===")
+        for src_rel_display, out_basename in collisions_log:
+            logging.info(f"[COLLISION] {src_rel_display} -> {out_basename}")
+
+    if skipped_folders_log:
+        logging.info("=== Folders skipped (system/hidden/output) ===")
+        for p in skipped_folders_log:
+            logging.info(p)
+
+    if error_files:
+        logging.info("=== Files with errors ===")
+        for s in error_files:
+            logging.info(s)
+
+    if changed_files:
+        logging.info("=== Files changed ===")
+        for s in changed_files:
+            logging.info(s)
+
+    if unchanged_files:
+        logging.info("=== Files with NO changes ===")
+        for s in unchanged_files:
+            logging.info(s)
+
+    logging.info("=== Run finished ===")
+    print("\nDone. See detailed results in:", log_path)
+
+if __name__ == "__main__":
+    main()
