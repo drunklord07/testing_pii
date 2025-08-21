@@ -1,24 +1,25 @@
 import os
 import re
+import multiprocessing
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import multiprocessing
+from tqdm import tqdm  # Make sure to install tqdm using: pip install tqdm
 
 # ------------------ CONFIGURATION ------------------
-# Set your input folder path here
 INPUT_FOLDER = "/absolute/path/to/your/input_txts"
-OUTPUT_FOLDER = "./output_cleaned_txts"  # Relative to current working directory
+OUTPUT_FOLDER = "./output_cleaned_txts"  # Output folder (relative)
+SUMMARY_FILE = "summary_report.txt"      # Summary in current working directory
 # ---------------------------------------------------
 
-# Regex to match timestamp only at the beginning of the line
+# Regex to match timestamp only at beginning of line
 TIMESTAMP_REGEX = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}\s*")
 
-# Threading setup
+# Thread setup
 total_cores = os.cpu_count() or multiprocessing.cpu_count()
 num_threads = max(1, total_cores - 2)
 print(f"Using {num_threads} threads out of {total_cores} cores")
 
-# Summary dictionary
+# Shared summary
 summary = {
     'total_files': 0,
     'files_processed': 0,
@@ -28,7 +29,7 @@ summary = {
     'per_file_stats': {}
 }
 
-def remove_timestamps_starting_line(line):
+def remove_timestamp(line):
     return TIMESTAMP_REGEX.sub('', line)
 
 def process_file(input_path: Path, input_dir: Path, output_dir: Path):
@@ -46,7 +47,7 @@ def process_file(input_path: Path, input_dir: Path, output_dir: Path):
         for line in lines:
             if TIMESTAMP_REGEX.match(line):
                 timestamp_count += 1
-                new_lines.append(remove_timestamps_starting_line(line))
+                new_lines.append(remove_timestamp(line))
             else:
                 new_lines.append(line)
 
@@ -73,10 +74,9 @@ def process_all_files(input_dir, output_dir):
     summary['total_files'] = len(txt_files)
 
     with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        futures = [executor.submit(process_file, file, input_dir, output_dir)
-                   for file in txt_files]
+        futures = {executor.submit(process_file, file, input_dir, output_dir): file for file in txt_files}
 
-        for future in as_completed(futures):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
             file_path, count, no_timestamp, error = future.result()
 
             if error:
@@ -90,13 +90,12 @@ def process_all_files(input_dir, output_dir):
             summary['total_timestamps_removed'] += count
             summary['per_file_stats'][file_path] = count
 
-def write_summary_report(output_dir):
-    report_path = Path(output_dir) / "summary_report.txt"
-    with open(report_path, 'w', encoding='utf-8') as report:
+def write_summary():
+    with open(SUMMARY_FILE, 'w', encoding='utf-8') as report:
         report.write("===== SUMMARY REPORT =====\n\n")
         report.write(f"Total .txt files found: {summary['total_files']}\n")
         report.write(f"Files successfully processed: {summary['files_processed']}\n")
-        report.write(f"Total timestamps removed (only if at start of line): {summary['total_timestamps_removed']}\n\n")
+        report.write(f"Total timestamps removed (start of lines only): {summary['total_timestamps_removed']}\n\n")
 
         report.write("----- Per File Timestamp Counts -----\n")
         for file, count in summary['per_file_stats'].items():
@@ -112,5 +111,6 @@ def write_summary_report(output_dir):
 
 if __name__ == "__main__":
     process_all_files(INPUT_FOLDER, OUTPUT_FOLDER)
-    write_summary_report(OUTPUT_FOLDER)
-    print("✅ Done. Cleaned files and summary_report.txt are in:", OUTPUT_FOLDER)
+    write_summary()
+    print(f"✅ Done. Cleaned files in: {OUTPUT_FOLDER}")
+    print(f"📄 Summary written to: {SUMMARY_FILE}")
