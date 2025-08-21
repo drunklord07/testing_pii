@@ -1,0 +1,116 @@
+import os
+import re
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+
+# ------------------ CONFIGURATION ------------------
+# Set your input folder path here
+INPUT_FOLDER = "/absolute/path/to/your/input_txts"
+OUTPUT_FOLDER = "./output_cleaned_txts"  # Relative to current working directory
+# ---------------------------------------------------
+
+# Regex to match timestamp only at the beginning of the line
+TIMESTAMP_REGEX = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}\s*")
+
+# Threading setup
+total_cores = os.cpu_count() or multiprocessing.cpu_count()
+num_threads = max(1, total_cores - 2)
+print(f"Using {num_threads} threads out of {total_cores} cores")
+
+# Summary dictionary
+summary = {
+    'total_files': 0,
+    'files_processed': 0,
+    'files_skipped': [],
+    'files_with_no_timestamp': [],
+    'total_timestamps_removed': 0,
+    'per_file_stats': {}
+}
+
+def remove_timestamps_starting_line(line):
+    return TIMESTAMP_REGEX.sub('', line)
+
+def process_file(input_path: Path, input_dir: Path, output_dir: Path):
+    try:
+        rel_path = input_path.relative_to(input_dir)
+        output_path = output_dir / rel_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(input_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        new_lines = []
+        timestamp_count = 0
+
+        for line in lines:
+            if TIMESTAMP_REGEX.match(line):
+                timestamp_count += 1
+                new_lines.append(remove_timestamps_starting_line(line))
+            else:
+                new_lines.append(line)
+
+        if timestamp_count == 0:
+            return (str(input_path), 0, True, None)
+
+        with open(output_path, 'w', encoding='utf-8') as f_out:
+            f_out.writelines(new_lines)
+
+        return (str(input_path), timestamp_count, False, None)
+
+    except Exception as e:
+        return (str(input_path), 0, False, str(e))
+
+def process_all_files(input_dir, output_dir):
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    txt_files = [Path(root) / file
+                 for root, _, files in os.walk(input_dir)
+                 for file in files if file.lower().endswith('.txt')]
+
+    summary['total_files'] = len(txt_files)
+
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = [executor.submit(process_file, file, input_dir, output_dir)
+                   for file in txt_files]
+
+        for future in as_completed(futures):
+            file_path, count, no_timestamp, error = future.result()
+
+            if error:
+                summary['files_skipped'].append((file_path, error))
+                continue
+
+            if no_timestamp:
+                summary['files_with_no_timestamp'].append(file_path)
+
+            summary['files_processed'] += 1
+            summary['total_timestamps_removed'] += count
+            summary['per_file_stats'][file_path] = count
+
+def write_summary_report(output_dir):
+    report_path = Path(output_dir) / "summary_report.txt"
+    with open(report_path, 'w', encoding='utf-8') as report:
+        report.write("===== SUMMARY REPORT =====\n\n")
+        report.write(f"Total .txt files found: {summary['total_files']}\n")
+        report.write(f"Files successfully processed: {summary['files_processed']}\n")
+        report.write(f"Total timestamps removed (only if at start of line): {summary['total_timestamps_removed']}\n\n")
+
+        report.write("----- Per File Timestamp Counts -----\n")
+        for file, count in summary['per_file_stats'].items():
+            report.write(f"{file} : {count} timestamps removed\n")
+
+        report.write("\n----- Files with NO timestamps at line start -----\n")
+        for file in summary['files_with_no_timestamp']:
+            report.write(f"{file}\n")
+
+        report.write("\n----- Skipped Files (with error) -----\n")
+        for file, error in summary['files_skipped']:
+            report.write(f"{file} : {error}\n")
+
+if __name__ == "__main__":
+    process_all_files(INPUT_FOLDER, OUTPUT_FOLDER)
+    write_summary_report(OUTPUT_FOLDER)
+    print("✅ Done. Cleaned files and summary_report.txt are in:", OUTPUT_FOLDER)
