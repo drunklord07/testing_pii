@@ -11,7 +11,12 @@ SUMMARY_FILE = "summary_report.txt"                 # Summary in current working
 # ---------------------------------------------------
 
 # Regex to match timestamp only at beginning of the line
-TIMESTAMP_REGEX = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}\s*")
+TIMESTAMP_REGEX = re.compile(
+    r"""^[\s"'\[]*(
+        (\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[.,:]\d{3,6}([+-]\d{2}:?\d{2})?) |
+        (\d{2}:\d{2}:\d{2}[.,:]\d{3,6})
+    )[\]"']*\s*""", re.VERBOSE
+)
 
 # Threading setup
 total_cores = os.cpu_count() or multiprocessing.cpu_count()
