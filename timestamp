@@ -3,23 +3,22 @@ import re
 import multiprocessing
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm  # Make sure to install tqdm using: pip install tqdm
-
+from tqdm import tqdm 
 # ------------------ CONFIGURATION ------------------
-INPUT_FOLDER = "/absolute/path/to/your/input_txts"
-OUTPUT_FOLDER = "./output_cleaned_txts"  # Output folder (relative)
-SUMMARY_FILE = "summary_report.txt"      # Summary in current working directory
+INPUT_FOLDER = "/absolute/path/to/your/input_txts"  # <-- CHANGE THIS
+OUTPUT_FOLDER = "./output_cleaned_txts"             # Output folder (relative)
+SUMMARY_FILE = "summary_report.txt"                 # Summary in current working directory
 # ---------------------------------------------------
 
-# Regex to match timestamp only at beginning of line
+# Regex to match timestamp only at beginning of the line
 TIMESTAMP_REGEX = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}\s*")
 
-# Thread setup
+# Threading setup
 total_cores = os.cpu_count() or multiprocessing.cpu_count()
 num_threads = max(1, total_cores - 2)
 print(f"Using {num_threads} threads out of {total_cores} cores")
 
-# Shared summary
+# Global summary
 summary = {
     'total_files': 0,
     'files_processed': 0,
@@ -51,13 +50,11 @@ def process_file(input_path: Path, input_dir: Path, output_dir: Path):
             else:
                 new_lines.append(line)
 
-        if timestamp_count == 0:
-            return (str(input_path), 0, True, None)
-
+        # Always write the file — even if no timestamps found
         with open(output_path, 'w', encoding='utf-8') as f_out:
             f_out.writelines(new_lines)
 
-        return (str(input_path), timestamp_count, False, None)
+        return (str(input_path), timestamp_count, timestamp_count == 0, None)
 
     except Exception as e:
         return (str(input_path), 0, False, str(e))
@@ -95,7 +92,7 @@ def write_summary():
         report.write("===== SUMMARY REPORT =====\n\n")
         report.write(f"Total .txt files found: {summary['total_files']}\n")
         report.write(f"Files successfully processed: {summary['files_processed']}\n")
-        report.write(f"Total timestamps removed (start of lines only): {summary['total_timestamps_removed']}\n\n")
+        report.write(f"Total timestamps removed (only at line start): {summary['total_timestamps_removed']}\n\n")
 
         report.write("----- Per File Timestamp Counts -----\n")
         for file, count in summary['per_file_stats'].items():
@@ -112,5 +109,5 @@ def write_summary():
 if __name__ == "__main__":
     process_all_files(INPUT_FOLDER, OUTPUT_FOLDER)
     write_summary()
-    print(f"✅ Done. Cleaned files in: {OUTPUT_FOLDER}")
+    print(f"\n✅ All files processed. Cleaned logs saved in: {OUTPUT_FOLDER}")
     print(f"📄 Summary written to: {SUMMARY_FILE}")
