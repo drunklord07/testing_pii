@@ -1,20 +1,18 @@
 import os
 import re
+import sys
 
 # ======== CONFIGURATION ========= #
-INPUT_FOLDER = "/path/to/your/folder"  # ← 🔧 Replace with your folder path
+INPUT_FOLDER = "/path/to/your/folder"  # ← 🔧 Set your input folder path here
 # ================================= #
 
-# Derived output folder and summary file
 base_name = os.path.basename(os.path.normpath(INPUT_FOLDER))
 OUTPUT_FOLDER = f"mobile_fixed_{base_name}"
 SUMMARY_FILE = "mobile_cleanup_done.txt"
 
-# Regex to locate specific MOBILE_REGEX patterns
 MOBILE_REGEX_TRIPLET = re.compile(r";no_field;(\d{7,20});MOBILE_REGEX;", re.IGNORECASE)
 
 def is_valid_mobile(number: str) -> bool:
-    """Returns True if the number is a valid Indian mobile number."""
     if number.startswith("+91"):
         number = number[3:]
     elif number.startswith("91"):
@@ -22,7 +20,6 @@ def is_valid_mobile(number: str) -> bool:
     return len(number) == 10 and number[0] in "6789"
 
 def clean_line(line: str):
-    """Remove invalid mobile matches; return cleaned line, removed count, and a flag for complete removal."""
     matches = MOBILE_REGEX_TRIPLET.findall(line)
     removed_count = 0
     original_line = line
@@ -34,12 +31,17 @@ def clean_line(line: str):
             removed_count += 1
 
     cleaned_line = line.strip()
-    # Determine if this line had *only* invalid MOBILE_REGEX
     only_had_invalid_mobile = (
         removed_count > 0 and
         MOBILE_REGEX_TRIPLET.sub('', original_line).strip() == ""
     )
     return (None if only_had_invalid_mobile else line, removed_count, only_had_invalid_mobile)
+
+def print_progress(current, total, bar_width=40):
+    done = int(bar_width * current / total)
+    remaining = bar_width - done
+    bar = f"[{'█' * done}{'.' * remaining}] {current}/{total}"
+    print(f"\r{bar}", end='', flush=True)
 
 def main():
     if not os.path.isdir(INPUT_FOLDER):
@@ -48,7 +50,6 @@ def main():
 
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-    # Tracking stats
     total_files = 0
     total_lines = 0
     total_mobile_removed = 0
@@ -56,10 +57,10 @@ def main():
     total_lines_removed = 0
     skipped_files = []
 
-    for filename in os.listdir(INPUT_FOLDER):
-        if not filename.endswith(".txt"):
-            continue
+    all_txt_files = [f for f in os.listdir(INPUT_FOLDER) if f.endswith(".txt")]
+    total_file_count = len(all_txt_files)
 
+    for idx, filename in enumerate(all_txt_files, 1):
         input_path = os.path.join(INPUT_FOLDER, filename)
         output_path = os.path.join(OUTPUT_FOLDER, filename)
 
@@ -92,9 +93,12 @@ def main():
 
         except Exception as e:
             skipped_files.append((filename, str(e)))
-            print(f"⚠️ Error processing {filename}: {e}")
 
-    # Write summary log
+        print_progress(idx, total_file_count)
+
+    print()  # newline after progress bar
+
+    # Write summary
     with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
         f.write("=== MOBILE_REGEX Cleanup Summary ===\n")
         f.write(f"Total files scanned: {total_files}\n")
@@ -112,9 +116,9 @@ def main():
 
         f.write("====================================\n")
 
-    print(f"\n✅ Cleanup done.")
-    print(f"🗂 Cleaned files → {OUTPUT_FOLDER}")
-    print(f"📄 Summary → {SUMMARY_FILE}")
+    print(f"\n✅ Cleanup complete.")
+    print(f"🗂 Cleaned files saved in → {OUTPUT_FOLDER}")
+    print(f"📄 Summary written to → {SUMMARY_FILE}")
 
 if __name__ == "__main__":
     main()
