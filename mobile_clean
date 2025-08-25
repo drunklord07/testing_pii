@@ -8,6 +8,7 @@ INPUT_FOLDER = "/your/path/to/input/folder"  # ← 🔧 Set your folder path her
 base_name = os.path.basename(os.path.normpath(INPUT_FOLDER))
 OUTPUT_FOLDER = f"mobile_fixed_{base_name}"
 SUMMARY_FILE = "mobile_cleanup_summary.txt"
+REMOVED_LINES_LOG = "removed_lines.log"
 
 # Pattern to identify MOBILE_REGEX triplets
 MOBILE_TRIPLET_PATTERN = re.compile(r";no_field;([^;]+);MOBILE_REGEX;", re.IGNORECASE)
@@ -35,9 +36,6 @@ OTHER_VALID_PATTERNS = [
 ]
 
 def is_valid_mobile_number(value: str, full_line: str) -> bool:
-    """
-    Validate that value is a true mobile number (not embedded), and exists verbatim in the log part.
-    """
     if not (re.fullmatch(r"[6-9]\d{9}", value) or re.fullmatch(r"91[6-9]\d{9}", value)):
         return False
 
@@ -46,23 +44,20 @@ def is_valid_mobile_number(value: str, full_line: str) -> bool:
     if triplet_index == -1:
         return False
 
-    log_content = full_line[:triplet_index]
-    match_pos = log_content.find(value)
+    content = full_line[:triplet_index]
+    match_pos = content.find(value)
     if match_pos == -1:
         return False
 
-    left = log_content[match_pos - 1] if match_pos > 0 else ''
-    right = log_content[match_pos + len(value)] if match_pos + len(value) < len(log_content) else ''
+    left = content[match_pos - 1] if match_pos > 0 else ''
+    right = content[match_pos + len(value)] if match_pos + len(value) < len(content) else ''
 
     if left.isalnum() or right.isalnum():
         return False
     return True
 
 def has_other_valid_matches(line: str) -> bool:
-    for pattern in OTHER_VALID_PATTERNS:
-        if pattern.search(line):
-            return True
-    return False
+    return any(pattern.search(line) for pattern in OTHER_VALID_PATTERNS)
 
 def process_line(line: str):
     original_line = line
@@ -78,8 +73,8 @@ def process_line(line: str):
     line = line.strip("; \n") + "\n"
 
     if removed_count == len(matches) and not has_other_valid_matches(original_line):
-        return None, removed_count, True
-    return line, removed_count, False
+        return None, removed_count, True, original_line
+    return line, removed_count, False, None
 
 def print_progress(current, total, width=40):
     done = int(width * current / total)
@@ -101,6 +96,7 @@ def main():
     total_lines_deleted = 0
     total_written_files = 0
     skipped = []
+    removed_log_lines = []
 
     for idx, file in enumerate(files, 1):
         input_path = os.path.join(INPUT_FOLDER, file)
@@ -117,10 +113,11 @@ def main():
 
             for line in lines:
                 total_lines += 1
-                cleaned, removed_count, deleted = process_line(line)
+                cleaned, removed_count, deleted, removed_line = process_line(line)
                 if deleted:
                     total_lines_deleted += 1
                     deleted_lines += 1
+                    removed_log_lines.append(removed_line.strip())
                     continue
                 if cleaned:
                     new_lines.append(cleaned)
@@ -155,8 +152,13 @@ def main():
                 f.write(f"{name} → {reason}\n")
         f.write("====================================\n")
 
+    with open(REMOVED_LINES_LOG, "w", encoding="utf-8") as f:
+        for line in removed_log_lines:
+            f.write(line + "\n")
+
     print(f"📁 Output folder: {OUTPUT_FOLDER}")
     print(f"📄 Summary: {SUMMARY_FILE}")
+    print(f"🧾 Removed lines log: {REMOVED_LINES_LOG}")
 
 if __name__ == "__main__":
     main()
