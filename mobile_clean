@@ -3,28 +3,38 @@ import re
 import sys
 
 # ======== CONFIGURATION ========= #
-INPUT_FOLDER = "/path/to/your/folder"  # ← 🔧 Replace with your input folder path
+INPUT_FOLDER = "/path/to/your/folder"  # ← 🔧 Replace with your folder path
 # ================================= #
 
 base_name = os.path.basename(os.path.normpath(INPUT_FOLDER))
 OUTPUT_FOLDER = f"mobile_fixed_{base_name}"
 SUMMARY_FILE = "mobile_cleanup_done.txt"
 
+# Match triplet: ;no_field;<value>;MOBILE_REGEX;
 MOBILE_REGEX_TRIPLET = re.compile(r";no_field;([^;]{7,20});MOBILE_REGEX;", re.IGNORECASE)
 
-def is_valid_mobile(number: str) -> bool:
-    """Ensure number is strictly valid standalone Indian mobile number."""
-    # Reject if it contains anything but digits
-    if not number.isdigit():
-        return False
+def is_wrapped_in_text(line: str, value: str) -> bool:
+    """
+    Check if `value` is found in the original log content and is wrapped
+    by letters or digits (i.e., embedded inside another word/ID).
+    """
+    # Search before the match block
+    split_index = line.find(f";no_field;{value};MOBILE_REGEX;")
+    if split_index == -1:
+        return True  # Fail-safe: remove it
 
-    # Remove known prefixes
-    if number.startswith("+91"):
-        number = number[3:]
-    elif number.startswith("91"):
-        number = number[2:]
+    content = line[:split_index]
+    match_pos = content.find(value)
+    if match_pos == -1:
+        return True  # Not found = suspicious
 
-    return len(number) == 10 and number[0] in "6789"
+    left = content[match_pos - 1] if match_pos > 0 else ""
+    right = content[match_pos + len(value)] if match_pos + len(value) < len(content) else ""
+
+    # If wrapped by letters or digits, it's invalid
+    if left.isalnum() or right.isalnum():
+        return True
+    return False
 
 def clean_line(line: str):
     matches = MOBILE_REGEX_TRIPLET.findall(line)
@@ -32,7 +42,7 @@ def clean_line(line: str):
     original_line = line
 
     for match in matches:
-        if not is_valid_mobile(match):
+        if is_wrapped_in_text(line, match):
             pattern = f";no_field;{match};MOBILE_REGEX;"
             line = line.replace(pattern, "")
             removed_count += 1
