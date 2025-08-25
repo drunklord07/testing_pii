@@ -3,20 +3,27 @@ import re
 import sys
 
 # ======== CONFIGURATION ========= #
-INPUT_FOLDER = "/path/to/your/folder"  # ← 🔧 Set your input folder path here
+INPUT_FOLDER = "/path/to/your/folder"  # ← 🔧 Replace with your input folder path
 # ================================= #
 
 base_name = os.path.basename(os.path.normpath(INPUT_FOLDER))
 OUTPUT_FOLDER = f"mobile_fixed_{base_name}"
 SUMMARY_FILE = "mobile_cleanup_done.txt"
 
-MOBILE_REGEX_TRIPLET = re.compile(r";no_field;(\d{7,20});MOBILE_REGEX;", re.IGNORECASE)
+MOBILE_REGEX_TRIPLET = re.compile(r";no_field;([^;]{7,20});MOBILE_REGEX;", re.IGNORECASE)
 
 def is_valid_mobile(number: str) -> bool:
+    """Ensure number is strictly valid standalone Indian mobile number."""
+    # Reject if it contains anything but digits
+    if not number.isdigit():
+        return False
+
+    # Remove known prefixes
     if number.startswith("+91"):
         number = number[3:]
     elif number.startswith("91"):
         number = number[2:]
+
     return len(number) == 10 and number[0] in "6789"
 
 def clean_line(line: str):
