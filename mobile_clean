@@ -1,0 +1,120 @@
+import os
+import re
+
+# ======== CONFIGURATION ========= #
+INPUT_FOLDER = "/path/to/your/folder"  # ← 🔧 Replace with your folder path
+# ================================= #
+
+# Derived output folder and summary file
+base_name = os.path.basename(os.path.normpath(INPUT_FOLDER))
+OUTPUT_FOLDER = f"mobile_fixed_{base_name}"
+SUMMARY_FILE = "mobile_cleanup_done.txt"
+
+# Regex to locate specific MOBILE_REGEX patterns
+MOBILE_REGEX_TRIPLET = re.compile(r";no_field;(\d{7,20});MOBILE_REGEX;", re.IGNORECASE)
+
+def is_valid_mobile(number: str) -> bool:
+    """Returns True if the number is a valid Indian mobile number."""
+    if number.startswith("+91"):
+        number = number[3:]
+    elif number.startswith("91"):
+        number = number[2:]
+    return len(number) == 10 and number[0] in "6789"
+
+def clean_line(line: str):
+    """Remove invalid mobile matches; return cleaned line, removed count, and a flag for complete removal."""
+    matches = MOBILE_REGEX_TRIPLET.findall(line)
+    removed_count = 0
+    original_line = line
+
+    for match in matches:
+        if not is_valid_mobile(match):
+            pattern = f";no_field;{match};MOBILE_REGEX;"
+            line = line.replace(pattern, "")
+            removed_count += 1
+
+    cleaned_line = line.strip()
+    # Determine if this line had *only* invalid MOBILE_REGEX
+    only_had_invalid_mobile = (
+        removed_count > 0 and
+        MOBILE_REGEX_TRIPLET.sub('', original_line).strip() == ""
+    )
+    return (None if only_had_invalid_mobile else line, removed_count, only_had_invalid_mobile)
+
+def main():
+    if not os.path.isdir(INPUT_FOLDER):
+        print(f"❌ Error: '{INPUT_FOLDER}' is not a valid directory.")
+        return
+
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+    # Tracking stats
+    total_files = 0
+    total_lines = 0
+    total_mobile_removed = 0
+    total_mobile_remaining = 0
+    total_lines_removed = 0
+    skipped_files = []
+
+    for filename in os.listdir(INPUT_FOLDER):
+        if not filename.endswith(".txt"):
+            continue
+
+        input_path = os.path.join(INPUT_FOLDER, filename)
+        output_path = os.path.join(OUTPUT_FOLDER, filename)
+
+        try:
+            with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+
+            cleaned_lines = []
+            mobile_remaining = 0
+            removed_mobile_count = 0
+            lines_removed_count = 0
+
+            for line in lines:
+                total_lines += 1
+                cleaned, removed, delete_line = clean_line(line)
+                removed_mobile_count += removed
+                if delete_line:
+                    lines_removed_count += 1
+                    continue
+                cleaned_lines.append(cleaned if cleaned.endswith("\n") else cleaned + "\n")
+                mobile_remaining += len(MOBILE_REGEX_TRIPLET.findall(cleaned))
+
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.writelines(cleaned_lines)
+
+            total_files += 1
+            total_mobile_removed += removed_mobile_count
+            total_mobile_remaining += mobile_remaining
+            total_lines_removed += lines_removed_count
+
+        except Exception as e:
+            skipped_files.append((filename, str(e)))
+            print(f"⚠️ Error processing {filename}: {e}")
+
+    # Write summary log
+    with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
+        f.write("=== MOBILE_REGEX Cleanup Summary ===\n")
+        f.write(f"Total files scanned: {total_files}\n")
+        f.write(f"Total lines scanned: {total_lines}\n")
+        f.write(f"Total MOBILE_REGEX matches removed: {total_mobile_removed}\n")
+        f.write(f"Total MOBILE_REGEX matches remaining: {total_mobile_remaining}\n")
+        f.write(f"Total lines completely removed: {total_lines_removed}\n")
+        f.write("\n")
+
+        if skipped_files:
+            f.write("=== Files Skipped Due to Errors ===\n")
+            for name, reason in skipped_files:
+                f.write(f"{name} → {reason}\n")
+            f.write("\n")
+
+        f.write("====================================\n")
+
+    print(f"\n✅ Cleanup done.")
+    print(f"🗂 Cleaned files → {OUTPUT_FOLDER}")
+    print(f"📄 Summary → {SUMMARY_FILE}")
+
+if __name__ == "__main__":
+    main()
