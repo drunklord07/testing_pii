@@ -1,141 +1,81 @@
 import os
 import re
-import sys
+import shutil
+from tqdm import tqdm
 
-# ======== CONFIGURATION ========= #
-INPUT_FOLDER = "/path/to/your/folder"  # ← 🔧 Replace with your folder path
-# ================================= #
+# ========= USER CONFIG =========
+INPUT_FOLDER = "your_folder_path_here"  # <--- Put your path here
+OUTPUT_FOLDER = "output_mobile_sanitized"
+SUMMARY_FILE = "summary.txt"
+# ===============================
 
-base_name = os.path.basename(os.path.normpath(INPUT_FOLDER))
-OUTPUT_FOLDER = f"mobile_fixed_{base_name}"
-SUMMARY_FILE = "mobile_cleanup_done.txt"
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# Match triplet: ;no_field;<value>;MOBILE_REGEX;
-MOBILE_REGEX_TRIPLET = re.compile(r";no_field;([^;]{7,20});MOBILE_REGEX;", re.IGNORECASE)
-
-def is_wrapped_in_text(line: str, value: str) -> bool:
-    """
-    Check if `value` is found in the original log content and is wrapped
-    by letters or digits (i.e., embedded inside another word/ID).
-    """
-    # Search before the match block
-    split_index = line.find(f";no_field;{value};MOBILE_REGEX;")
-    if split_index == -1:
-        return True  # Fail-safe: remove it
-
-    content = line[:split_index]
-    match_pos = content.find(value)
-    if match_pos == -1:
-        return True  # Not found = suspicious
-
-    left = content[match_pos - 1] if match_pos > 0 else ""
-    right = content[match_pos + len(value)] if match_pos + len(value) < len(content) else ""
-
-    # If wrapped by letters or digits, it's invalid
-    if left.isalnum() or right.isalnum():
-        return True
-    return False
-
-def clean_line(line: str):
-    matches = MOBILE_REGEX_TRIPLET.findall(line)
-    removed_count = 0
-    original_line = line
-
-    for match in matches:
-        if is_wrapped_in_text(line, match):
-            pattern = f";no_field;{match};MOBILE_REGEX;"
-            line = line.replace(pattern, "")
-            removed_count += 1
-
-    cleaned_line = line.strip()
-    only_had_invalid_mobile = (
-        removed_count > 0 and
-        MOBILE_REGEX_TRIPLET.sub('', original_line).strip() == ""
+def is_valid_mobile(number: str) -> bool:
+    return (
+        re.fullmatch(r'(91)?[6-9]\d{9}', number) is not None
+        and not re.search(r'[A-Za-z]', number)
     )
-    return (None if only_had_invalid_mobile else line, removed_count, only_had_invalid_mobile)
 
-def print_progress(current, total, bar_width=40):
-    done = int(bar_width * current / total)
-    remaining = bar_width - done
-    bar = f"[{'█' * done}{'.' * remaining}] {current}/{total}"
-    print(f"\r{bar}", end='', flush=True)
+files = [f for f in os.listdir(INPUT_FOLDER) if f.endswith(".txt")]
 
-def main():
-    if not os.path.isdir(INPUT_FOLDER):
-        print(f"❌ Error: '{INPUT_FOLDER}' is not a valid directory.")
-        return
+lines_scanned = 0
+mobiles_removed = 0
+mobiles_retained = 0
+lines_removed = 0
+files_scanned = 0
 
-    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+for file in tqdm(files, desc="Processing files"):
+    files_scanned += 1
+    input_path = os.path.join(INPUT_FOLDER, file)
+    output_path = os.path.join(OUTPUT_FOLDER, file)
 
-    total_files = 0
-    total_lines = 0
-    total_mobile_removed = 0
-    total_mobile_remaining = 0
-    total_lines_removed = 0
-    skipped_files = []
+    with open(input_path, "r", encoding="utf-8", errors="ignore") as infile, \
+         open(output_path, "w", encoding="utf-8") as outfile:
 
-    all_txt_files = [f for f in os.listdir(INPUT_FOLDER) if f.endswith(".txt")]
-    total_file_count = len(all_txt_files)
+        for line in infile:
+            lines_scanned += 1
+            parts = line.strip().split(";")
+            new_parts = []
+            i = 0
 
-    for idx, filename in enumerate(all_txt_files, 1):
-        input_path = os.path.join(INPUT_FOLDER, filename)
-        output_path = os.path.join(OUTPUT_FOLDER, filename)
+            found_valid_mobile = False
+            found_invalid_mobile = False
+            found_other_regex = False
 
-        try:
-            with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
+            while i < len(parts):
+                if i+2 < len(parts) and parts[i] == "no_field" and parts[i+2] == "MOBILE_REGEX":
+                    mobile_candidate = parts[i+1].strip()
+                    if is_valid_mobile(mobile_candidate):
+                        found_valid_mobile = True
+                        mobiles_retained += 1
+                        new_parts.extend(parts[i:i+3])
+                    else:
+                        found_invalid_mobile = True
+                        mobiles_removed += 1
+                    i += 3
+                else:
+                    if i+2 < len(parts) and parts[i] == "no_field" and parts[i+2] != "MOBILE_REGEX":
+                        found_other_regex = True
+                    new_parts.append(parts[i])
+                    i += 1
 
-            cleaned_lines = []
-            mobile_remaining = 0
-            removed_mobile_count = 0
-            lines_removed_count = 0
+            # Remove full line if it had only invalid mobile regex and nothing else
+            if found_invalid_mobile and not found_valid_mobile and not found_other_regex:
+                lines_removed += 1
+                continue
 
-            for line in lines:
-                total_lines += 1
-                cleaned, removed, delete_line = clean_line(line)
-                removed_mobile_count += removed
-                if delete_line:
-                    lines_removed_count += 1
-                    continue
-                cleaned_lines.append(cleaned if cleaned.endswith("\n") else cleaned + "\n")
-                mobile_remaining += len(MOBILE_REGEX_TRIPLET.findall(cleaned))
+            cleaned = ";".join(new_parts).strip(";")
+            outfile.write(cleaned + "\n")
 
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.writelines(cleaned_lines)
-
-            total_files += 1
-            total_mobile_removed += removed_mobile_count
-            total_mobile_remaining += mobile_remaining
-            total_lines_removed += lines_removed_count
-
-        except Exception as e:
-            skipped_files.append((filename, str(e)))
-
-        print_progress(idx, total_file_count)
-
-    print()  # newline after progress bar
-
-    # Write summary
-    with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
-        f.write("=== MOBILE_REGEX Cleanup Summary ===\n")
-        f.write(f"Total files scanned: {total_files}\n")
-        f.write(f"Total lines scanned: {total_lines}\n")
-        f.write(f"Total MOBILE_REGEX matches removed: {total_mobile_removed}\n")
-        f.write(f"Total MOBILE_REGEX matches remaining: {total_mobile_remaining}\n")
-        f.write(f"Total lines completely removed: {total_lines_removed}\n")
-        f.write("\n")
-
-        if skipped_files:
-            f.write("=== Files Skipped Due to Errors ===\n")
-            for name, reason in skipped_files:
-                f.write(f"{name} → {reason}\n")
-            f.write("\n")
-
-        f.write("====================================\n")
-
-    print(f"\n✅ Cleanup complete.")
-    print(f"🗂 Cleaned files saved in → {OUTPUT_FOLDER}")
-    print(f"📄 Summary written to → {SUMMARY_FILE}")
-
-if __name__ == "__main__":
-    main()
+# Write summary
+with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
+    f.write("Summary of MOBILE_REGEX Cleanup\n")
+    f.write("==================================\n")
+    f.write(f"Input folder                  : {INPUT_FOLDER}\n")
+    f.write(f"Output folder                 : {OUTPUT_FOLDER}\n")
+    f.write(f"Files scanned                 : {files_scanned}\n")
+    f.write(f"Lines scanned                 : {lines_scanned}\n")
+    f.write(f"Valid MOBILE_REGEX retained   : {mobiles_retained}\n")
+    f.write(f"Invalid MOBILE_REGEX removed  : {mobiles_removed}\n")
+    f.write(f"Lines removed (only invalid)  : {lines_removed}\n")
