@@ -1,0 +1,137 @@
+import os
+import re
+import shutil
+import sys
+
+# === Timestamp regex: all known variants ===
+TIMESTAMP_REGEX = re.compile(
+    r"""(?x)
+    (?:\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,:]\d{3,9})?(?:Z|[+-]\d{2}:?\d{2})?)   # ISO 8601
+    |(?:\d{2}:\d{2}:\d{2}(?:[.,:]\d{3,9})?)                                              # Time-only
+    |(?:\d{2}_\d{2}_\d{4}\s\d{2}:\d{2}:\d{2}(?:[.,:]\d{3,9})?)                           # DD_MM_YYYY
+    |(?:\[[^\]]*?\d{2}:\d{2}:\d{2}[^\]]*?\])                                             # Bracketed time
+    |(?:[A-Z][a-z]{2}\s[A-Z][a-z]{2}\s\d{2}\s\d{2}:\d{2}:\d{2}\s\d{4})                   # C-style
+    """
+)
+
+# PII match pattern (to process no_field)
+PII_MATCH_REGEX = re.compile(r'(.*?);no_field;([^;]+);([A-Z_]+_REGEX|ADDRESS KEYWORD|NAME_KEYWORD|.*?);?(Valid|Invalid)?;?(.*)')
+
+# Field name detector
+FIELD_NAME_REGEX = re.compile(r'(\b\w{3,40}\b)\s*[:=]\s*$')
+
+def extract_field_name(context_left: str) -> str:
+    match = FIELD_NAME_REGEX.search(context_left)
+    return match.group(1) if match else "no_field"
+
+def fix_no_field_lines(lines):
+    fixed_lines = []
+    updated = 0
+    still_not_found = 0
+    failed = 0
+    lines_with_ts = 0
+    lines_without_ts = 0
+
+    for line in lines:
+        if TIMESTAMP_REGEX.search(line):
+            lines_with_ts += 1
+        else:
+            lines_without_ts += 1
+
+        if ";no_field;" not in line:
+            fixed_lines.append(line)
+            continue
+
+        try:
+            parts = line.strip().split(";")
+            new_parts = []
+            i = 0
+            while i < len(parts):
+                if i + 2 < len(parts) and parts[i+1] == "no_field":
+                    value = parts[i+2]
+                    pii_type = parts[i+3] if (i+3 < len(parts)) else ""
+                    line_prefix = ";".join(parts[:i])
+                    context_left = line_prefix[-100:]  # left context window
+                    field_name = extract_field_name(context_left)
+                    if field_name != "no_field":
+                        updated += 1
+                    else:
+                        still_not_found += 1
+                    new_parts.extend([parts[i], field_name, value, pii_type])
+                    i += 4
+                else:
+                    new_parts.append(parts[i])
+                    i += 1
+
+            fixed_lines.append(";".join(new_parts))
+        except Exception as e:
+            failed += 1
+            fixed_lines.append(line)
+
+    return fixed_lines, updated, still_not_found, failed, lines_with_ts, lines_without_ts
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python fix_fields_and_check_timestamps.py <input_folder>")
+        sys.exit(1)
+
+    input_folder = sys.argv[1]
+    if not os.path.isdir(input_folder):
+        print(f"Error: '{input_folder}' is not a directory.")
+        sys.exit(1)
+
+    base_name = os.path.basename(os.path.normpath(input_folder))
+    output_folder = f"fixed_{base_name}"
+    os.makedirs(output_folder, exist_ok=True)
+
+    total_files = 0
+    total_lines = 0
+    total_updated = 0
+    total_not_found = 0
+    total_failed = 0
+    total_ts = 0
+    total_no_ts = 0
+
+    for filename in os.listdir(input_folder):
+        if not filename.endswith(".txt"):
+            continue
+
+        input_path = os.path.join(input_folder, filename)
+        output_path = os.path.join(output_folder, filename)
+        try:
+            with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+
+            fixed_lines, updated, not_found, failed, with_ts, without_ts = fix_no_field_lines(lines)
+
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.writelines(line + ("\n" if not line.endswith("\n") else "") for line in fixed_lines)
+
+            total_files += 1
+            total_lines += len(lines)
+            total_updated += updated
+            total_not_found += not_found
+            total_failed += failed
+            total_ts += with_ts
+            total_no_ts += without_ts
+
+        except Exception as e:
+            print(f"Error processing {filename}: {e}")
+
+    # Write summary to all_done.txt
+    with open("all_done.txt", "w", encoding="utf-8") as summary:
+        summary.write("=== Field Fixing + Timestamp Summary ===\n")
+        summary.write(f"Total files scanned: {total_files}\n")
+        summary.write(f"Total lines scanned: {total_lines}\n")
+        summary.write(f"Fields updated: {total_updated}\n")
+        summary.write(f"Still no_field: {total_not_found}\n")
+        summary.write(f"Lines failed to process: {total_failed}\n")
+        summary.write(f"Lines with timestamp: {total_ts}\n")
+        summary.write(f"Lines without timestamp: {total_no_ts}\n")
+        summary.write("========================================\n")
+
+    print(f"✅ Done. Updated files are in: {output_folder}")
+    print("📄 Summary written to: all_done.txt")
+
+if __name__ == "__main__":
+    main()
