@@ -1,76 +1,23 @@
 from pathlib import Path
 from tqdm import tqdm
-import re
 
-# ================= Configuration ================= #
-input_dir = Path("mobile_fixed_logs")  # ← Update this to your path
-report_path = Path("total_count_report.txt")
-# ================================================= #
+# ========== Configuration ==========
+input_dir = Path("mobile_fixed_logs")  # Update this to your cleaned input folder
+report_path = Path("triplet_tag_summary.txt")
+# ===================================
 
-# Aadhaar Verhoeff checksum tables
-mult = [
-    [0,1,2,3,4,5,6,7,8,9],
-    [1,2,3,4,0,6,7,8,9,5],
-    [2,3,4,0,1,7,8,9,5,6],
-    [3,4,0,1,2,8,9,5,6,7],
-    [4,0,1,2,3,9,5,6,7,8],
-    [5,9,8,7,6,0,4,3,2,1],
-    [6,5,9,8,7,1,0,4,3,2],
-    [7,6,5,9,8,2,1,0,4,3],
-    [8,7,6,5,9,3,2,1,0,4],
-    [9,8,7,6,5,4,3,2,1,0]
-]
-perm = [
-    [0,1,2,3,4,5,6,7,8,9],
-    [1,5,7,6,2,8,3,0,9,4],
-    [5,8,0,3,7,9,6,1,4,2],
-    [8,9,1,6,0,4,3,5,2,7],
-    [9,4,5,3,1,2,6,8,7,0],
-    [4,2,8,6,5,7,3,9,0,1],
-    [2,7,9,3,8,0,6,4,1,5],
-    [7,0,4,6,9,1,3,2,5,8]
-]
-def validate_aadhaar(aadhar):
-    try:
-        x = 0
-        j = 0
-        for digit in reversed(aadhar):
-            x = mult[x][perm[j % 8][int(digit)]]
-            j += 1
-        return x == 0
-    except Exception:
-        return False
-
-# ================= Patterns ================= #
-PII_PATTERNS = {
-    "AADHAAR_REGEX": re.compile(r'(?<!\d)([0-9]{12})(?!\d)'),
-    "DL_REGEX": re.compile(r'\b[A-Z]{2}[0-9]{2}[-\s]?[0-9]{11}\b'),
-    "GSTIN_REGEX": re.compile(r'\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]\b', re.IGNORECASE),
-    "IP_REGEX": re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b'),
-    "MAC_REGEX": re.compile(r'\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b'),
-    "COORD_REGEX": re.compile(r'\b-?[0-9]{1,3}\.[0-9]+[,\s]+-?[0-9]{1,3}\.[0-9]+\b'),
-    "EMAIL_REGEX": re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'),
-    "MOBILE_REGEX": re.compile(r'(?<!\d)(?:\+91|91|0)?[6-9][0-9]{9}(?!\d)'),
-    "PAN_REGEX": re.compile(r'\b[A-Z]{5}[0-9]{4}[A-Z]\b', re.IGNORECASE),
-    "UPI_REGEX": re.compile(r'\b[A-Za-z0-9.\-_]{2,}@[A-Za-z]{2,}\b'),
-    "VOTERID_REGEX": re.compile(r'\b[A-Z]{3}[0-9]{7}\b'),
-    "CARD_REGEX": re.compile(r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|2(?:2[2-9][0-9]{12}|[3-6][0-9]{13}|7(?:[01][0-9]{12}|20[0-9]{12}))|3[47][0-9]{13}|60[0-9]{14}|65[0-9]{14}|81[0-9]{14}|508[0-9]{13})\b')
+VALID_TAGS = {
+    "CARD_REGEX", "AADHAAR_REGEX", "PAN_REGEX", "VOTERID_REGEX", "EMAIL_REGEX",
+    "GSTIN_REGEX", "DL_REGEX", "IP_REGEX", "MAC_REGEX", "COORD_REGEX", "UPI_REGEX",
+    "ADDRESS_KEYWORD", "NAME_KEYWORD", "DOB_KEYWORD", "ACCOUNT_NUMBER_KEYWORD",
+    "CUSTOMER_ID_KEYWORD", "SENSITIVE_HINTS_KEYWORD", "INSURANCE_POLICY_KEYWORD",
+    "MOBILE_REGEX"
 }
-KEYWORDS = {
-    "ADDRESS_KEYWORD": re.compile(r'\b(address|full address|complete address|residential address|permanent address)\b', re.IGNORECASE),
-    "NAME_KEYWORD": re.compile(r'\b(name|nam)\b', re.IGNORECASE),
-    "DOB_KEYWORD": re.compile(r'\b(date of birth|dob|birthdate|born on)\b', re.IGNORECASE),
-    "ACCOUNT_NUMBER_KEYWORD": re.compile(r'\b(account number|acc number|bank account|account no|a/c no)\b', re.IGNORECASE),
-    "CUSTOMER_ID_KEYWORD": re.compile(r'\b(customer id|cust id|customer number|cust)\b', re.IGNORECASE),
-    "SENSITIVE_HINTS_KEYWORD": re.compile(r'\b(national id|identity card|proof of identity|document number)\b', re.IGNORECASE),
-    "INSURANCE_POLICY_KEYWORD": re.compile(r'\b(insurance number|policy number|insurance id|ins id)\b', re.IGNORECASE),
-}
-# ================= Scanning ================= #
-pii_counts = {key: 0 for key in PII_PATTERNS}
-keyword_counts = {key: 0 for key in KEYWORDS}
-total_pii_lines = 0
-total_lines = 0
+
+pii_tag_counts = {tag: 0 for tag in VALID_TAGS}
 total_files = 0
+total_lines = 0
+lines_with_any_tag = 0
 
 all_txt_files = list(input_dir.rglob("*.txt"))
 
@@ -79,40 +26,27 @@ for file in tqdm(all_txt_files, desc="Scanning files"):
     with open(file, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
             total_lines += 1
-            line_has_pii = False
-            for key, pattern in PII_PATTERNS.items():
-                if key == "AADHAAR_REGEX":
-                    matches = pattern.findall(line)
-                    for match in matches:
-                        if validate_aadhaar(match):
-                            pii_counts[key] += 1
-                            line_has_pii = True
-                else:
-                    matches = pattern.findall(line)
-                    if matches:
-                        pii_counts[key] += len(matches)
-                        line_has_pii = True
-            for key, pattern in KEYWORDS.items():
-                matches = pattern.findall(line)
-                if matches:
-                    keyword_counts[key] += len(matches)
-            if line_has_pii:
-                total_pii_lines += 1
+            parts = line.strip().split(';')
+            tag_count = 0
+            for i in range(len(parts) - 2):
+                if parts[i+2] in VALID_TAGS:
+                    pii_tag_counts[parts[i+2]] += 1
+                    tag_count += 1
+            if tag_count > 0:
+                lines_with_any_tag += 1
 
-# ================= Reporting ================= #
+# ========== Reporting ==========
 with open(report_path, 'w') as f:
-    f.write("==== TOTAL PII SCANNING REPORT ====\n\n")
+    f.write("===== FAST TAG-BASED TRIPLET SUMMARY =====\n\n")
     f.write(f"Total Files Scanned: {total_files}\n")
     f.write(f"Total Lines Scanned: {total_lines}\n")
-    f.write(f"Total Lines Containing PII: {total_pii_lines}\n\n")
+    f.write(f"Lines Containing Any PII Tag: {lines_with_any_tag}\n\n")
 
-    total_pii = sum(pii_counts.values())
-    f.write(f"Total PII Matches: {total_pii}\n\n")
+    total_pii = sum(pii_tag_counts.values())
+    f.write(f"Total PII Triplets (Tag-Matched): {total_pii}\n\n")
 
-    f.write("---- Per-Type PII Counts ----\n")
-    for key, count in pii_counts.items():
-        f.write(f"{key:<30}: {count}\n")
+    f.write("---- Per-Type PII Tag Counts ----\n")
+    for tag, count in pii_tag_counts.items():
+        f.write(f"{tag:<35}: {count}\n")
 
-    f.write("\n---- Keyword Matches ----\n")
-    for key, count in keyword_counts.items():
-        f.write(f"{key:<30}: {count}\n")
+print(f"\n✅ Summary written to: {report_path}")
