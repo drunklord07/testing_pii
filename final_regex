@@ -1,0 +1,178 @@
+import os
+import re
+from pathlib import Path
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+
+# ========== Configuration ==========
+input_dir = Path("path_to_input_logs")  # <-- Replace this with your actual folder path
+output_dir = Path("output_logs")
+report_path = Path("summary_report.txt")
+# ===================================
+
+# Aadhaar Verhoeff checksum validation
+mult = [
+    [0,1,2,3,4,5,6,7,8,9],
+    [1,2,3,4,0,6,7,8,9,5],
+    [2,3,4,0,1,7,8,9,5,6],
+    [3,4,0,1,2,8,9,5,6,7],
+    [4,0,1,2,3,9,5,6,7,8],
+    [5,9,8,7,6,0,4,3,2,1],
+    [6,5,9,8,7,1,0,4,3,2],
+    [7,6,5,9,8,2,1,0,4,3],
+    [8,7,6,5,9,3,2,1,0,4],
+    [9,8,7,6,5,4,3,2,1,0]
+]
+perm = [
+    [0,1,2,3,4,5,6,7,8,9],
+    [1,5,7,6,2,8,3,0,9,4],
+    [5,8,0,3,7,9,6,1,4,2],
+    [8,9,1,6,0,4,3,5,2,7],
+    [9,4,5,3,1,2,6,8,7,0],
+    [4,2,8,6,5,7,3,9,0,1],
+    [2,7,9,3,8,0,6,4,1,5],
+    [7,0,4,6,9,1,3,2,5,8]
+]
+def validate_aadhaar(aadhar):
+    try:
+        x = 0
+        for j, digit in enumerate(reversed(aadhar)):
+            x = mult[x][perm[j % 8][int(digit)]]
+        return x == 0
+    except Exception:
+        return False
+
+# Regex patterns
+PII_PATTERNS = {
+    "AADHAAR_REGEX": re.compile(r'(?<!\d)([0-9]{12})(?!\d)'),
+    "DL_REGEX": re.compile(r'\b[A-Z]{2}[0-9]{2}[-\s]?[0-9]{11}\b', re.IGNORECASE),
+    "GSTIN_REGEX": re.compile(r'\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]\b', re.IGNORECASE),
+    "IP_REGEX": re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b'),
+    "MAC_REGEX": re.compile(r'\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b'),
+    "COORD_REGEX": re.compile(r'\b-?[0-9]{1,3}\.[0-9]+[,\s]+-?[0-9]{1,3}\.[0-9]+\b'),
+    "EMAIL_REGEX": re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'),
+    "MOBILE_REGEX": re.compile(r'(?<!\d)(?:\+91|91|0)?[6-9][0-9]{9}(?!\d)'),
+    "PAN_REGEX": re.compile(r'\b[A-Z]{5}[0-9]{4}[A-Z]\b', re.IGNORECASE),
+    "UPI_REGEX": re.compile(r'\b[A-Za-z0-9.\-_]{2,}@[A-Za-z]{2,}\b'),
+    "VOTERID_REGEX": re.compile(r'\b[A-Z]{3}[0-9]{7}\b', re.IGNORECASE),
+    "CARD_REGEX": re.compile(
+        r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|2(?:2[2-9][0-9]{12}|[3-6][0-9]{13}|'
+        r'7(?:[01][0-9]{12}|20[0-9]{12}))|3[47][0-9]{13}|60[0-9]{14}|65[0-9]{14}|81[0-9]{14}|508[0-9]{13})\b'
+    )
+}
+
+# Main processing function per file
+def process_file(file_path):
+    try:
+        relative_path = file_path.relative_to(input_dir)
+        output_file_path = output_dir / relative_path
+        output_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+
+        out_lines, match_count, type_counts, added_lines = [], 0, {k: 0 for k in PII_PATTERNS}, 0
+        for line in lines:
+            stripped_line = line.strip()
+            if not stripped_line:
+                out_lines.append(line)
+                continue
+
+            if ";" not in stripped_line:
+                out_lines.append(line)
+                continue
+
+            content, path = stripped_line.rsplit(";", 1)
+            found = False
+            matches = []
+
+            for tag, pattern in PII_PATTERNS.items():
+                if tag == "AADHAAR_REGEX":
+                    for m in pattern.finditer(content):
+                        if validate_aadhaar(m.group()):
+                            matches.append((m.start(), m.group(), tag))
+                else:
+                    for m in pattern.finditer(content):
+                        matches.append((m.start(), m.group(), tag))
+
+            if matches:
+                matches.sort(key=lambda x: x[0])
+                match_count += len(matches)
+                for _, value, tag in matches:
+                    type_counts[tag] += 1
+                    out_lines.append(f"{content};{path} {value};{tag}\n")
+                added_lines += len(matches) - 1
+            else:
+                out_lines.append(line)
+
+        with open(output_file_path, "w", encoding="utf-8") as f:
+            f.writelines(out_lines)
+
+        return {
+            "file": str(file_path),
+            "lines": len(lines),
+            "matches": match_count,
+            "per_type": type_counts,
+            "added": added_lines,
+            "blank": len(lines) == 0,
+            "error": None
+        }
+
+    except Exception as e:
+        return {"file": str(file_path), "lines": 0, "matches": 0, "per_type": {k: 0 for k in PII_PATTERNS}, "added": 0, "blank": False, "error": str(e)}
+
+# Main execution function
+def run_pii_extraction(input_dir, output_dir, report_path):
+    output_dir.mkdir(exist_ok=True)
+    all_txt_files = list(input_dir.rglob("*.txt"))
+
+    cpu_total = os.cpu_count() or multiprocessing.cpu_count()
+    max_workers = max(1, cpu_total - 2)
+    summary = {
+        "files": 0,
+        "lines": 0,
+        "matches": 0,
+        "per_type": {k: 0 for k in PII_PATTERNS},
+        "added_lines": 0,
+        "blank_files": [],
+        "errors": [],
+    }
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_file, file): file for file in all_txt_files}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
+            result = fut.result()
+            summary["files"] += 1
+            summary["lines"] += result["lines"]
+            summary["matches"] += result["matches"]
+            summary["added_lines"] += result["added"]
+            for k in PII_PATTERNS:
+                summary["per_type"][k] += result["per_type"].get(k, 0)
+            if result["blank"]:
+                summary["blank_files"].append(result["file"])
+            if result["error"]:
+                summary["errors"].append((result["file"], result["error"]))
+
+    final_lines = summary["lines"] + summary["added_lines"]
+    with open(report_path, "w", encoding="utf-8") as rep:
+        rep.write("=== PII Extraction Summary Report ===\n")
+        rep.write(f"Files scanned: {summary['files']}\n")
+        rep.write(f"Total lines scanned: {summary['lines']}\n")
+        rep.write(f"Total PII matches: {summary['matches']}\n")
+        rep.write(f"Lines added due to multiple matches: {summary['added_lines']}\n")
+        rep.write(f"Final output line count: {final_lines}\n\n")
+        rep.write("--- Match counts by PII type ---\n")
+        for k, v in summary["per_type"].items():
+            rep.write(f"{k}: {v}\n")
+        if summary["blank_files"]:
+            rep.write("\n--- Blank Files ---\n")
+            for f in summary["blank_files"]:
+                rep.write(f"{f}\n")
+        if summary["errors"]:
+            rep.write("\n--- Errors ---\n")
+            for f, err in summary["errors"]:
+                rep.write(f"{f} --> {err}\n")
+
+# Run the script
+run_pii_extraction(input_dir, output_dir, report_path)
