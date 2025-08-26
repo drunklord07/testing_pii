@@ -3,7 +3,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 # ====== CONFIGURATION ====== #
-INPUT_ROOT = Path("/your/full/path/here")  # 🔧 CHANGE THIS LINE to your input folder
+INPUT_ROOT = Path("/your/full/path/here")  # 🔧 CHANGE THIS TO YOUR INPUT FOLDER
 OUTPUT_ROOT = Path(f"triplets_stripped_{INPUT_ROOT.name}")
 SUMMARY_PATH = Path("strip_summary.txt")
 ALLOWED_EXTS = {".txt"}
@@ -26,16 +26,19 @@ def clean_line(line: str) -> str:
     parts = line.strip().split(';')
 
     if len(parts) < 3:
-        return line  # Nothing to sanitize
+        return line  # Not enough parts to contain triplets
 
-    # Try to detect triplet block by scanning backwards
-    for i in range(len(parts) - 2, 0, -3):
-        if i % 3 == 1:
-            log_part = ';'.join(parts[:i])
-            path_part = parts[-1]
-            return f"{log_part};{path_part}"  # Ensure exactly one semicolon
+    path_part = parts[-1]
+    middle_part = parts[1:-1]
 
-    return line  # Fallback
+    # Triplets are always in groups of 3: field;value;TAG
+    triplet_count = len(middle_part) // 3
+    remove_count = triplet_count * 3
+
+    # Keep: first part (log) + any leftovers before triplet start
+    log_parts = parts[:1] + middle_part[:len(middle_part) - remove_count]
+
+    return ';'.join(log_parts) + ";" + path_part
 
 def process_file(input_path: Path, output_path: Path):
     try:
