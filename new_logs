@@ -7,7 +7,28 @@ INPUT_ROOT = Path("/your/full/path/here")  # 🔧 CHANGE THIS TO YOUR INPUT FOLD
 OUTPUT_ROOT = Path(f"triplets_stripped_{INPUT_ROOT.name}")
 SUMMARY_PATH = Path("strip_summary.txt")
 ALLOWED_EXTS = {".txt"}
-# =========================== #
+
+VALID_TAGS = {
+    "CARD_REGEX",
+    "AADHAAR_REGEX",
+    "PAN_REGEX",
+    "VOTERID_REGEX",
+    "EMAIL_REGEX",
+    "GSTIN_REGEX",
+    "DL_REGEX",
+    "IP_REGEX",
+    "MAC_REGEX",
+    "COORD_REGEX",
+    "UPI_REGEX",
+    "ADDRESS_KEYWORD",
+    "NAME_KEYWORD",
+    "DOB_KEYWORD",
+    "ACCOUNT_NUMBER_KEYWORD",
+    "CUSTOMER_ID_KEYWORD",
+    "SENSITIVE_HINTS_KEYWORD",
+    "INSURANCE_POLICY_KEYWORD",
+}
+# ============================ #
 
 summary = {
     "total_files": 0,
@@ -19,26 +40,42 @@ summary = {
     "empty_files": 0,
     "error_files": [],
 }
-
 file_status = []
+
+def is_valid_triplet(triplet: list[str]) -> bool:
+    """
+    Validate a triplet of [field, value, tag].
+    We only remove it if the tag is in the known valid set (case-insensitive).
+    """
+    return (
+        len(triplet) == 3 and
+        triplet[2].strip().upper() in VALID_TAGS
+    )
 
 def clean_line(line: str) -> str:
     parts = line.strip().split(';')
 
-    if len(parts) < 3:
-        return line  # Not enough parts to contain triplets
+    if len(parts) < 4:
+        return line  # Not enough parts to sanitize
 
     path_part = parts[-1]
-    middle_part = parts[1:-1]
+    body = parts[:-1]
 
-    # Triplets are always in groups of 3: field;value;TAG
-    triplet_count = len(middle_part) // 3
-    remove_count = triplet_count * 3
+    # Walk backward in chunks of 3
+    triplets_to_remove = 0
+    i = len(body)
+    while i >= 3:
+        candidate = body[i - 3:i]
+        if is_valid_triplet(candidate):
+            triplets_to_remove += 1
+            i -= 3
+        else:
+            break
 
-    # Keep: first part (log) + any leftovers before triplet start
-    log_parts = parts[:1] + middle_part[:len(middle_part) - remove_count]
+    keep_up_to = len(body) - (triplets_to_remove * 3)
+    log_part = body[:keep_up_to]
 
-    return ';'.join(log_parts) + ";" + path_part
+    return ';'.join(log_part) + ";" + path_part
 
 def process_file(input_path: Path, output_path: Path):
     try:
@@ -111,8 +148,8 @@ def main():
         for line in file_status:
             sf.write(line + "\n")
 
-    print(f"\n✅ All done.")
-    print(f"📁 Cleaned files written to: {OUTPUT_ROOT}")
+    print(f"\n✅ Done.")
+    print(f"📁 Output folder: {OUTPUT_ROOT}")
     print(f"📝 Summary saved to: {SUMMARY_PATH}")
 
 if __name__ == "__main__":
