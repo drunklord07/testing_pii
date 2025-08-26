@@ -3,30 +3,17 @@ from pathlib import Path
 from tqdm import tqdm
 
 # ====== CONFIGURATION ====== #
-INPUT_ROOT = Path("/your/full/path/here")  # 🔧 CHANGE THIS TO YOUR INPUT FOLDER
+INPUT_ROOT = Path("/your/full/path/here")  # 🔧 CHANGE THIS
 OUTPUT_ROOT = Path(f"triplets_stripped_{INPUT_ROOT.name}")
 SUMMARY_PATH = Path("strip_summary.txt")
 ALLOWED_EXTS = {".txt"}
 
 VALID_TAGS = {
-    "CARD_REGEX",
-    "AADHAAR_REGEX",
-    "PAN_REGEX",
-    "VOTERID_REGEX",
-    "EMAIL_REGEX",
-    "GSTIN_REGEX",
-    "DL_REGEX",
-    "IP_REGEX",
-    "MAC_REGEX",
-    "COORD_REGEX",
-    "UPI_REGEX",
-    "ADDRESS_KEYWORD",
-    "NAME_KEYWORD",
-    "DOB_KEYWORD",
-    "ACCOUNT_NUMBER_KEYWORD",
-    "CUSTOMER_ID_KEYWORD",
-    "SENSITIVE_HINTS_KEYWORD",
-    "INSURANCE_POLICY_KEYWORD",
+    "CARD_REGEX", "AADHAAR_REGEX", "PAN_REGEX", "VOTERID_REGEX", "EMAIL_REGEX",
+    "GSTIN_REGEX", "DL_REGEX", "IP_REGEX", "MAC_REGEX", "COORD_REGEX", "UPI_REGEX",
+    "ADDRESS_KEYWORD", "NAME_KEYWORD", "DOB_KEYWORD", "ACCOUNT_NUMBER_KEYWORD",
+    "CUSTOMER_ID_KEYWORD", "SENSITIVE_HINTS_KEYWORD", "INSURANCE_POLICY_KEYWORD",
+    "MOBILE_REGEX"  # ← Make sure this is included too
 }
 # ============================ #
 
@@ -44,8 +31,7 @@ file_status = []
 
 def is_valid_triplet(triplet: list[str]) -> bool:
     """
-    Validate a triplet of [field, value, tag].
-    We only remove it if the tag is in the known valid set (case-insensitive).
+    A triplet is valid if the 3rd item (tag) matches known tags (case-insensitive).
     """
     return (
         len(triplet) == 3 and
@@ -56,12 +42,11 @@ def clean_line(line: str) -> str:
     parts = line.strip().split(';')
 
     if len(parts) < 4:
-        return line  # Not enough parts to sanitize
+        return line  # Too short to have triplets
 
     path_part = parts[-1]
     body = parts[:-1]
 
-    # Walk backward in chunks of 3
     triplets_to_remove = 0
     i = len(body)
     while i >= 3:
