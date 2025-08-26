@@ -1,12 +1,13 @@
 import os
 from pathlib import Path
+from tqdm import tqdm
 
-# ===== HARD-CODED PATH HERE ===== #
-INPUT_ROOT = Path("/your/full/path/here")  # ⬅️ CHANGE THIS LINE to your input folder
+# ====== CONFIGURATION ====== #
+INPUT_ROOT = Path("/your/full/path/here")  # 🔧 CHANGE THIS LINE to your input folder
 OUTPUT_ROOT = Path(f"triplets_stripped_{INPUT_ROOT.name}")
-SUMMARY_PATH = Path("strip_summary.txt")  # Will be saved in current directory
+SUMMARY_PATH = Path("strip_summary.txt")
 ALLOWED_EXTS = {".txt"}
-# ================================= #
+# =========================== #
 
 summary = {
     "total_files": 0,
@@ -22,14 +23,19 @@ summary = {
 file_status = []
 
 def clean_line(line: str) -> str:
-    if ';' not in line:
-        return line
-
     parts = line.strip().split(';')
-    if len(parts) < 3:
-        return line  # Not enough parts to clean
 
-    return f"{parts[0]};{parts[-1]}"  # Keep log and final field (usually path)
+    if len(parts) < 3:
+        return line  # Nothing to sanitize
+
+    # Try to detect triplet block by scanning backwards
+    for i in range(len(parts) - 2, 0, -3):
+        if i % 3 == 1:
+            log_part = ';'.join(parts[:i])
+            path_part = parts[-1]
+            return f"{log_part};{path_part}"  # Ensure exactly one semicolon
+
+    return line  # Fallback
 
 def process_file(input_path: Path, output_path: Path):
     try:
@@ -81,16 +87,17 @@ def process_file(input_path: Path, output_path: Path):
 def main():
     OUTPUT_ROOT.mkdir(exist_ok=True)
 
-    for root, _, files in os.walk(INPUT_ROOT):
-        for filename in files:
-            if not filename.lower().endswith(".txt"):
-                continue
+    all_files = [
+        Path(root) / filename
+        for root, _, files in os.walk(INPUT_ROOT)
+        for filename in files
+        if filename.lower().endswith(".txt")
+    ]
 
-            in_path = Path(root) / filename
-            rel_path = in_path.relative_to(INPUT_ROOT)
-            out_path = OUTPUT_ROOT / rel_path
-
-            process_file(in_path, out_path)
+    for in_path in tqdm(all_files, desc="Processing files", unit="file"):
+        rel_path = in_path.relative_to(INPUT_ROOT)
+        out_path = OUTPUT_ROOT / rel_path
+        process_file(in_path, out_path)
 
     # Write summary
     with open(SUMMARY_PATH, "w") as sf:
