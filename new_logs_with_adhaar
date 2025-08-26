@@ -8,7 +8,6 @@ OUTPUT_ROOT = Path(f"triplets_stripped_{INPUT_ROOT.name}")
 SUMMARY_PATH = Path("strip_summary.txt")
 ALLOWED_EXTS = {".txt"}
 
-# AADHAAR_REGEX handled as special 4-field block
 VALID_TAGS = {
     "CARD_REGEX", "PAN_REGEX", "VOTERID_REGEX", "EMAIL_REGEX",
     "GSTIN_REGEX", "DL_REGEX", "IP_REGEX", "MAC_REGEX", "COORD_REGEX", "UPI_REGEX",
@@ -16,6 +15,7 @@ VALID_TAGS = {
     "CUSTOMER_ID_KEYWORD", "SENSITIVE_HINTS_KEYWORD", "INSURANCE_POLICY_KEYWORD",
     "MOBILE_REGEX"
 }
+# AADHAAR_REGEX is handled as 4-field block, not here
 # ============================ #
 
 summary = {
@@ -33,21 +33,19 @@ file_status = []
 def clean_line(line: str) -> str:
     parts = line.strip().split(';')
     if len(parts) < 4:
-        return line  # Too short to contain triplets/quads
+        return line
 
     path_part = parts[-1]
     body = parts[:-1]
     i = len(body)
 
     while i >= 3:
-        # Aadhaar 4-field pattern: ends with AADHAAR_REGEX in 3rd index
         if i >= 4:
             quad = body[i - 4:i]
             if quad[2].strip().upper() == "AADHAAR_REGEX":
                 i -= 4
                 continue
 
-        # Normal triplet: ends with any known tag
         triplet = body[i - 3:i]
         if triplet[2].strip().upper() in VALID_TAGS:
             i -= 3
@@ -94,7 +92,7 @@ def process_file(input_path: Path, output_path: Path):
         else:
             summary["files_unchanged"] += 1
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w", encoding='utf-8') as outfile:
             outfile.write("\n".join(cleaned_lines) + "\n")
 
@@ -107,15 +105,12 @@ def process_file(input_path: Path, output_path: Path):
 def main():
     OUTPUT_ROOT.mkdir(exist_ok=True)
 
-    # ✅ Recursively find all .txt files
     all_files = list(INPUT_ROOT.rglob("*.txt"))
 
     for in_path in tqdm(all_files, desc="Processing files", unit="file"):
-        rel_path = in_path.relative_to(INPUT_ROOT)
-        out_path = OUTPUT_ROOT / rel_path
+        out_path = OUTPUT_ROOT / in_path.name  # ✅ Flattened output structure
         process_file(in_path, out_path)
 
-    # Summary
     with open(SUMMARY_PATH, "w") as sf:
         sf.write("==== STRIP SUMMARY ====\n")
         for k, v in summary.items():
