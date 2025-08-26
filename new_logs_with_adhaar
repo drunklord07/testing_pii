@@ -1,0 +1,135 @@
+import os
+from pathlib import Path
+from tqdm import tqdm
+
+# ====== CONFIGURATION ====== #
+INPUT_ROOT = Path("/your/full/path/here")  # 🔧 CHANGE THIS
+OUTPUT_ROOT = Path(f"triplets_stripped_{INPUT_ROOT.name}")
+SUMMARY_PATH = Path("strip_summary.txt")
+ALLOWED_EXTS = {".txt"}
+
+# AADHAAR_REGEX handled separately as a 4-field block (not included here)
+VALID_TAGS = {
+    "CARD_REGEX", "PAN_REGEX", "VOTERID_REGEX", "EMAIL_REGEX",
+    "GSTIN_REGEX", "DL_REGEX", "IP_REGEX", "MAC_REGEX", "COORD_REGEX", "UPI_REGEX",
+    "ADDRESS_KEYWORD", "NAME_KEYWORD", "DOB_KEYWORD", "ACCOUNT_NUMBER_KEYWORD",
+    "CUSTOMER_ID_KEYWORD", "SENSITIVE_HINTS_KEYWORD", "INSURANCE_POLICY_KEYWORD",
+    "MOBILE_REGEX"
+}
+# ============================ #
+
+summary = {
+    "total_files": 0,
+    "files_changed": 0,
+    "files_unchanged": 0,
+    "total_lines": 0,
+    "lines_changed": 0,
+    "blank_lines": 0,
+    "empty_files": 0,
+    "error_files": [],
+}
+file_status = []
+
+def clean_line(line: str) -> str:
+    parts = line.strip().split(';')
+    if len(parts) < 4:
+        return line  # Too short to have triplets/quads
+
+    path_part = parts[-1]
+    body = parts[:-1]
+    i = len(body)
+
+    while i >= 3:
+        # Check Aadhaar quad block (4-part ending with AADHAAR_REGEX)
+        if i >= 4:
+            quad = body[i - 4:i]
+            if quad[2].strip().upper() == "AADHAAR_REGEX":
+                i -= 4
+                continue
+
+        # Check regular triplet (3-part ending in valid tag)
+        triplet = body[i - 3:i]
+        if triplet[2].strip().upper() in VALID_TAGS:
+            i -= 3
+        else:
+            break
+
+    log_part = body[:i]
+    return ';'.join(log_part) + ";" + path_part
+
+def process_file(input_path: Path, output_path: Path):
+    try:
+        with open(input_path, 'r', encoding='utf-8', errors='ignore') as infile:
+            lines = infile.readlines()
+
+        summary["total_files"] += 1
+        summary["total_lines"] += len(lines)
+
+        cleaned_lines = []
+        lines_changed = 0
+        blank_lines = 0
+        non_blank_lines = 0
+
+        for line in lines:
+            original = line.rstrip("\n")
+            if not original.strip():
+                blank_lines += 1
+                cleaned_lines.append("")
+                continue
+
+            non_blank_lines += 1
+            cleaned = clean_line(original)
+            if cleaned != original:
+                lines_changed += 1
+            cleaned_lines.append(cleaned)
+
+        summary["lines_changed"] += lines_changed
+        summary["blank_lines"] += blank_lines
+
+        if non_blank_lines == 0:
+            summary["empty_files"] += 1
+
+        if lines_changed > 0:
+            summary["files_changed"] += 1
+        else:
+            summary["files_unchanged"] += 1
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding='utf-8') as outfile:
+            outfile.write("\n".join(cleaned_lines) + "\n")
+
+        file_status.append(f"{input_path} => {'CHANGED' if lines_changed > 0 else 'UNCHANGED'} ({lines_changed} lines changed)")
+
+    except Exception as e:
+        summary["error_files"].append(str(input_path))
+        file_status.append(f"{input_path} => ERROR: {str(e)}")
+
+def main():
+    OUTPUT_ROOT.mkdir(exist_ok=True)
+
+    all_files = [
+        Path(root) / filename
+        for root, _, files in os.walk(INPUT_ROOT)
+        for filename in files
+        if filename.lower().endswith(".txt")
+    ]
+
+    for in_path in tqdm(all_files, desc="Processing files", unit="file"):
+        rel_path = in_path.relative_to(INPUT_ROOT)
+        out_path = OUTPUT_ROOT / rel_path
+        process_file(in_path, out_path)
+
+    with open(SUMMARY_PATH, "w") as sf:
+        sf.write("==== STRIP SUMMARY ====\n")
+        for k, v in summary.items():
+            sf.write(f"{k}: {v}\n")
+        sf.write("\n==== PER FILE STATUS ====\n")
+        for line in file_status:
+            sf.write(line + "\n")
+
+    print(f"\n✅ Done.")
+    print(f"📁 Output folder: {OUTPUT_ROOT}")
+    print(f"📝 Summary saved to: {SUMMARY_PATH}")
+
+if __name__ == "__main__":
+    main()
