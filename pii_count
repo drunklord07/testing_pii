@@ -1,46 +1,13 @@
-import os
-import re
 from pathlib import Path
+from tqdm import tqdm
+import re
 
-# ===== Configuration =====
-input_dir = Path("mobile_fixed_logs")  # Update as needed
+# ================= Configuration ================= #
+input_dir = Path("mobile_fixed_logs")  # ← Update this to your path
 report_path = Path("total_count_report.txt")
+# ================================================= #
 
-# ===== PII Patterns =====
-PII_PATTERNS = {
-    "AADHAAR_REGEX": re.compile(r'(?<!\d)(\d{12})(?!\d)'),
-    "DL_REGEX": re.compile(r'\b[A-Z]{2}[0-9]{2}[-\s]?[0-9]{4}[0-9]{7}\b', re.IGNORECASE),
-    "GSTIN_REGEX": re.compile(r'\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]\b', re.IGNORECASE),
-    "IP_REGEX": re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b'),
-    "MAC_REGEX": re.compile(r'\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b'),
-    "COORD_REGEX": re.compile(r'(?<![\d.])-?\d{1,3}\.\d+[,;\s]+-?\d{1,3}\.\d+(?![\d.])'),
-    "EMAIL_REGEX": re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'),
-    "MOBILE_REGEX": re.compile(r'(?<![a-zA-Z0-9])(?:\+91|91|0)?[6-9][0-9]{9}(?![a-zA-Z0-9])'),
-    "PAN_REGEX": re.compile(r'\b[A-Z]{5}[0-9]{4}[A-Z]\b', re.IGNORECASE),
-    "UPI_REGEX": re.compile(r'\b[\w.-]+@[\w]+\b'),
-    "VOTERID_REGEX": re.compile(r'\b[A-Z]{3}[0-9]{7}\b', re.IGNORECASE),
-    "CARD_REGEX": re.compile(
-        r'\b(?:'
-        r'4[0-9]{12}(?:[0-9]{3})?'
-        r'|5[1-5][0-9]{14}'
-        r'|2(?:2[2-9][0-9]{12}|[3-6][0-9]{13}|7(?:[01][0-9]{12}|20[0-9]{12}))'
-        r'|3[47][0-9]{13}'
-        r'|60[0-9]{14}'
-        r'|65[0-9]{14}'
-        r'|81[0-9]{14}'
-        r'|508[0-9]{13}'
-        r')\b'
-    ),
-    "ADDRESS_KEYWORD": re.compile(r'\b(address|full address|complete address|residential address|permanent address)\b', re.IGNORECASE),
-    "NAME_KEYWORD": re.compile(r'\b(name|nam)\b', re.IGNORECASE),
-    "DOB_KEYWORD": re.compile(r'\b(date of birth|dob|birthdate|born on)\b', re.IGNORECASE),
-    "ACCOUNT_NUMBER_KEYWORD": re.compile(r'\b(account number|acc number|bank account|account no|a/c no)\b', re.IGNORECASE),
-    "CUSTOMER_ID_KEYWORD": re.compile(r'\b(customer id|cust id|customer number|cust)\b', re.IGNORECASE),
-    "SENSITIVE_HINTS_KEYWORD": re.compile(r'\b(national id|identity card|proof of identity|document number)\b', re.IGNORECASE),
-    "INSURANCE_POLICY_KEYWORD": re.compile(r'\b(insurance number|policy number|insurance id|ins id)\b', re.IGNORECASE),
-}
-
-# Aadhaar Verhoeff Check
+# Aadhaar Verhoeff checksum tables
 mult = [
     [0,1,2,3,4,5,6,7,8,9],
     [1,2,3,4,0,6,7,8,9,5],
@@ -63,53 +30,89 @@ perm = [
     [2,7,9,3,8,0,6,4,1,5],
     [7,0,4,6,9,1,3,2,5,8]
 ]
-def validate_aadhaar(number: str) -> bool:
+def validate_aadhaar(aadhar):
     try:
         x = 0
-        for i, digit in enumerate(reversed(number)):
-            x = mult[x][perm[i % 8][int(digit)]]
+        j = 0
+        for digit in reversed(aadhar):
+            x = mult[x][perm[j % 8][int(digit)]]
+            j += 1
         return x == 0
     except Exception:
         return False
 
-# ===== Analysis =====
-pii_counts = {k: 0 for k in PII_PATTERNS}
+# ================= Patterns ================= #
+PII_PATTERNS = {
+    "AADHAAR_REGEX": re.compile(r'(?<!\d)([0-9]{12})(?!\d)'),
+    "DL_REGEX": re.compile(r'\b[A-Z]{2}[0-9]{2}[-\s]?[0-9]{11}\b'),
+    "GSTIN_REGEX": re.compile(r'\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]\b', re.IGNORECASE),
+    "IP_REGEX": re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b'),
+    "MAC_REGEX": re.compile(r'\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b'),
+    "COORD_REGEX": re.compile(r'\b-?[0-9]{1,3}\.[0-9]+[,\s]+-?[0-9]{1,3}\.[0-9]+\b'),
+    "EMAIL_REGEX": re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'),
+    "MOBILE_REGEX": re.compile(r'(?<!\d)(?:\+91|91|0)?[6-9][0-9]{9}(?!\d)'),
+    "PAN_REGEX": re.compile(r'\b[A-Z]{5}[0-9]{4}[A-Z]\b', re.IGNORECASE),
+    "UPI_REGEX": re.compile(r'\b[A-Za-z0-9.\-_]{2,}@[A-Za-z]{2,}\b'),
+    "VOTERID_REGEX": re.compile(r'\b[A-Z]{3}[0-9]{7}\b'),
+    "CARD_REGEX": re.compile(r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|2(?:2[2-9][0-9]{12}|[3-6][0-9]{13}|7(?:[01][0-9]{12}|20[0-9]{12}))|3[47][0-9]{13}|60[0-9]{14}|65[0-9]{14}|81[0-9]{14}|508[0-9]{13})\b')
+}
+KEYWORDS = {
+    "ADDRESS_KEYWORD": re.compile(r'\b(address|full address|complete address|residential address|permanent address)\b', re.IGNORECASE),
+    "NAME_KEYWORD": re.compile(r'\b(name|nam)\b', re.IGNORECASE),
+    "DOB_KEYWORD": re.compile(r'\b(date of birth|dob|birthdate|born on)\b', re.IGNORECASE),
+    "ACCOUNT_NUMBER_KEYWORD": re.compile(r'\b(account number|acc number|bank account|account no|a/c no)\b', re.IGNORECASE),
+    "CUSTOMER_ID_KEYWORD": re.compile(r'\b(customer id|cust id|customer number|cust)\b', re.IGNORECASE),
+    "SENSITIVE_HINTS_KEYWORD": re.compile(r'\b(national id|identity card|proof of identity|document number)\b', re.IGNORECASE),
+    "INSURANCE_POLICY_KEYWORD": re.compile(r'\b(insurance number|policy number|insurance id|ins id)\b', re.IGNORECASE),
+}
+# ================= Scanning ================= #
+pii_counts = {key: 0 for key in PII_PATTERNS}
+keyword_counts = {key: 0 for key in KEYWORDS}
 total_pii_lines = 0
 total_lines = 0
 total_files = 0
-files_with_pii = set()
 
-for file in input_dir.rglob("*.txt"):
+all_txt_files = list(input_dir.rglob("*.txt"))
+
+for file in tqdm(all_txt_files, desc="Scanning files"):
     total_files += 1
-    with open(file, "r", encoding="utf-8", errors="ignore") as f:
+    with open(file, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
-            line = line.strip()
-            if not line:
-                continue
             total_lines += 1
-            matched_any = False
-            for tag, pattern in PII_PATTERNS.items():
-                matches = pattern.findall(line)
-                if tag == "AADHAAR_REGEX":
-                    valid_matches = [m for m in matches if validate_aadhaar(m)]
-                    count = len(valid_matches)
+            line_has_pii = False
+            for key, pattern in PII_PATTERNS.items():
+                if key == "AADHAAR_REGEX":
+                    matches = pattern.findall(line)
+                    for match in matches:
+                        if validate_aadhaar(match):
+                            pii_counts[key] += 1
+                            line_has_pii = True
                 else:
-                    count = len(matches)
-                pii_counts[tag] += count
-                if count > 0:
-                    matched_any = True
-            if matched_any:
-                files_with_pii.add(file)
+                    matches = pattern.findall(line)
+                    if matches:
+                        pii_counts[key] += len(matches)
+                        line_has_pii = True
+            for key, pattern in KEYWORDS.items():
+                matches = pattern.findall(line)
+                if matches:
+                    keyword_counts[key] += len(matches)
+            if line_has_pii:
+                total_pii_lines += 1
 
-# ===== Write Report =====
-with open(report_path, "w") as f:
-    f.write("==== PII Summary Report ====\n\n")
-    f.write(f"Total files scanned     : {total_files}\n")
-    f.write(f"Total lines scanned     : {total_lines}\n")
-    f.write(f"Lines with any PII      : {len(files_with_pii)}\n")
-    f.write(f"Total PII matches       : {sum(pii_counts.values())}\n\n")
-    f.write("----- Individual PII Type Counts -----\n")
-    for tag, count in pii_counts.items():
-        f.write(f"{tag:<30}: {count}\n")
+# ================= Reporting ================= #
+with open(report_path, 'w') as f:
+    f.write("==== TOTAL PII SCANNING REPORT ====\n\n")
+    f.write(f"Total Files Scanned: {total_files}\n")
+    f.write(f"Total Lines Scanned: {total_lines}\n")
+    f.write(f"Total Lines Containing PII: {total_pii_lines}\n\n")
 
-report_path.name  # Just show file name after saving
+    total_pii = sum(pii_counts.values())
+    f.write(f"Total PII Matches: {total_pii}\n\n")
+
+    f.write("---- Per-Type PII Counts ----\n")
+    for key, count in pii_counts.items():
+        f.write(f"{key:<30}: {count}\n")
+
+    f.write("\n---- Keyword Matches ----\n")
+    for key, count in keyword_counts.items():
+        f.write(f"{key:<30}: {count}\n")
