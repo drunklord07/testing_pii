@@ -1,12 +1,12 @@
 import os
 from pathlib import Path
 
-# ===== CONFIGURATION ===== #
-INPUT_ROOT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./input_logs")
+# ===== HARD-CODED PATH HERE ===== #
+INPUT_ROOT = Path("/your/full/path/here")  # ⬅️ CHANGE THIS LINE to your input folder
 OUTPUT_ROOT = Path(f"triplets_stripped_{INPUT_ROOT.name}")
-SUMMARY_PATH = Path("strip_summary.txt")  # Saved in current working directory
+SUMMARY_PATH = Path("strip_summary.txt")  # Will be saved in current directory
 ALLOWED_EXTS = {".txt"}
-# ========================= #
+# ================================= #
 
 summary = {
     "total_files": 0,
@@ -27,9 +27,9 @@ def clean_line(line: str) -> str:
 
     parts = line.strip().split(';')
     if len(parts) < 3:
-        return line
+        return line  # Not enough parts to clean
 
-    return f"{parts[0]};{parts[-1]}"
+    return f"{parts[0]};{parts[-1]}"  # Keep log and final field (usually path)
 
 def process_file(input_path: Path, output_path: Path):
     try:
@@ -102,9 +102,8 @@ def main():
             sf.write(line + "\n")
 
     print(f"\n✅ All done.")
-    print(f"📁 Cleaned files: {OUTPUT_ROOT}")
-    print(f"📝 Summary file: {SUMMARY_PATH}")
+    print(f"📁 Cleaned files written to: {OUTPUT_ROOT}")
+    print(f"📝 Summary saved to: {SUMMARY_PATH}")
 
 if __name__ == "__main__":
-    import sys
     main()
