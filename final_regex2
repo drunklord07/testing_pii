@@ -10,7 +10,7 @@ INPUT_FOLDER = r"C:\Your\Full\Input\Path\Here"  # ← CHANGE THIS
 OUTPUT_FOLDER = "output_regex"
 SUMMARY_FILE = "summary_report.txt"
 
-# ======= FINAL REGEXES =======
+# ======= FINAL REGEXES WITH SAFE LOOKAROUNDS =======
 PII_PATTERNS = {
     "MOBILE_REGEX": re.compile(r'(?<![A-Za-z0-9])(?:\+91|91|0)?[6-9][0-9]{9}(?![A-Za-z0-9])'),
     "AADHAAR_REGEX": re.compile(r'(?<![A-Za-z0-9])(\d{12})(?![A-Za-z0-9])'),
@@ -70,7 +70,7 @@ def process_file(filepath: str, input_root: str) -> dict:
 
     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f, \
          open(output_path, 'w', encoding='utf-8') as outf, \
-         tqdm(desc=f"{rel_path}", unit="lines", leave=False) as pbar:
+         tqdm(desc=f"[{rel_path}]", unit="lines", leave=True) as pbar:
 
         for line in f:
             counts["total_lines"] += 1
@@ -91,7 +91,8 @@ def process_file(filepath: str, input_root: str) -> dict:
                     value = match.group(0)
                     if tag == "AADHAAR_REGEX" and not is_valid_aadhaar(value):
                         continue
-                    outf.write(f"{log_line};{path} {value};{tag}\n")
+                    # ✅ FIXED: Insert `;` between path and match value
+                    outf.write(f"{log_line};{path};{value};{tag}\n")
                     counts["matched_lines"] += 1
                     counts["match_type_counts"][tag] += 1
                     match_found = True
@@ -124,7 +125,7 @@ def run_scan():
     with ProcessPoolExecutor(max_workers=6) as executor:
         futures = [executor.submit(process_file, file, input_root) for file in all_files]
 
-        for future in tqdm(futures, desc="Overall Progress"):
+        for future in tqdm(futures, desc="Overall Progress", leave=True):
             result = future.result()
             total_summary["files_scanned"] += 1
             total_summary["total_lines"] += result["total_lines"]
