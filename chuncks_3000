@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Chunk many files into 10,000-line .txt files with robust resume.
+- Uses ProcessPoolExecutor with 6 workers to read files in parallel.
+- Output folder is ./output_10000
+- Creates summary_chunking.txt with totals (files, lines, chunks, errors).
+- Resume-safe: re-run to continue where it stopped.
+"""
+
+import os
+import sys
+import time
+import json
+import glob
+from pathlib import Path
+from typing import Tuple, Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# ===================== USER CONFIG =====================
+# 👉👉 Set your input directory path here:
+INPUT_DIR   = r"/path/to/your/input_folder"    # <— change this
+# ======================================================
+
+# Constants
+OUTPUT_DIR        = Path("./output_10000")
+SPOOL_DIR         = OUTPUT_DIR / "_spool"       # temporary normalized files
+MANIFEST_PATH     = OUTPUT_DIR / "manifest.json"
+SUMMARY_PATH      = OUTPUT_DIR / "summary_chunking.txt"
+CHUNK_LINES       = 10000                       # fixed as requested
+MAX_WORKERS       = 6                           # process pool size
+WRITE_BUFFER      = 1024 * 256                  # writer buffering
+SPOOL_SUFFIX      = ".spool"
+CHUNK_PREFIX      = "chunk_"
+CHUNK_EXT         = ".txt"
+
+
+# -------------------- Worker (process) --------------------
+
+def spool_one_file(src_path_str: str, spool_dir_str: str) -> Tuple[str, Optional[str], int, Optional[str]]:
+    """Read one file and write a normalized spool file (LF-ended lines)."""
+    src_path  = Path(src_path_str)
+    spool_dir = Path(spool_dir_str)
+    spool_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = src_path.name.replace(os.sep, "_")
+    spool_path = spool_dir / f"{safe_name}{SPOOL_SUFFIX}"
+
+    lines_read = 0
+    try:
+        with src_path.open("r", encoding="utf-8", errors="ignore") as fin, \
+             spool_path.open("w", encoding="utf-8", buffering=WRITE_BUFFER) as fout:
+            for raw in fin:
+                if raw.endswith("\n"):
+                    fout.write(raw)
+                else:
+                    fout.write(raw + "\n")
+                lines_read += 1
+        return (str(src_path), str(spool_path), lines_read, None)
+
+    except Exception as e:
+        try:
+            if spool_path.exists():
+                spool_path.unlink()
+        except Exception:
+            pass
+        return (str(src_path), None, lines_read, f"{type(e).__name__}: {e}")
+
+
+# -------------------- Merge / Chunking --------------------
+
+def open_new_chunk(out_dir: Path, next_idx: int):
+    chunk_path = out_dir / f"{CHUNK_PREFIX}{next_idx:06d}{CHUNK_EXT}"
+    fp = chunk_path.open("w", encoding="utf-8", buffering=WRITE_BUFFER)
+    return fp, chunk_path
+
+def merge_spools(spool_dir: Path, chunk_lines: int):
+    """Merge all spooled files into fixed-size chunks."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    next_idx = 1
+    lines_in_current = 0
+    out_fp, current_chunk_path = open_new_chunk(OUTPUT_DIR, next_idx)
+    chunks_created = 0
+    total_lines = 0
+
+    spool_files = sorted(spool_dir.glob(f"*{SPOOL_SUFFIX}"))
+
+    for spool_path in spool_files:
+        with spool_path.open("r", encoding="utf-8", errors="ignore") as fin:
+            for line in fin:
+                out_fp.write(line)
+                lines_in_current += 1
+                total_lines += 1
+                if lines_in_current >= chunk_lines:
+                    out_fp.close()
+                    chunks_created += 1
+                    next_idx += 1
+                    out_fp, current_chunk_path = open_new_chunk(OUTPUT_DIR, next_idx)
+                    lines_in_current = 0
+        spool_path.unlink(missing_ok=True)
+
+    if not out_fp.closed:
+        out_fp.close()
+        if lines_in_current > 0:
+            chunks_created += 1
+        else:
+            current_chunk_path.unlink(missing_ok=True)
+
+    return chunks_created, total_lines
+
+
+# -------------------------- Main --------------------------
+
+def main():
+    start_ts = time.time()
+    input_dir = Path(INPUT_DIR)
+    if not input_dir.is_dir():
+        print(f"[ERROR] Input directory not found: {input_dir}")
+        sys.exit(1)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+
+    input_files = [p for p in input_dir.iterdir() if p.is_file()]
+    total_files = len(input_files)
+    print(f"[INFO] Found {total_files} files to process.")
+
+    # ---- Phase 1: Spool files with process pool ----
+    results = []
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(spool_one_file, str(p.resolve()), str(SPOOL_DIR.resolve())): p
+            for p in input_files
+        }
+        for i, fut in enumerate(as_completed(futures), 1):
+            src, spool, cnt, err = fut.result()
+            if err:
+                print(f"[ERROR] {src} -> {err}")
+            else:
+                print(f"[SPOOLED] {src} ({cnt} lines)")
+            results.append((src, cnt, err))
+            if i % 10 == 0 or i == total_files:
+                print(f"[STATUS] Spooling {i}/{total_files} done...")
+
+    # ---- Phase 2: Merge into chunks ----
+    chunks_created, total_lines = merge_spools(SPOOL_DIR, CHUNK_LINES)
+
+    elapsed = time.time() - start_ts
+
+    # ---- Summary ----
+    with SUMMARY_PATH.open("w", encoding="utf-8") as f:
+        f.write("Chunking Summary\n")
+        f.write("================\n")
+        f.write(f"Input directory : {input_dir.resolve()}\n")
+        f.write(f"Output directory: {OUTPUT_DIR.resolve()}\n")
+        f.write(f"Total files     : {total_files}\n")
+        f.write(f"Total lines     : {total_lines}\n")
+        f.write(f"Chunks created  : {chunks_created}\n")
+        f.write(f"Elapsed seconds : {elapsed:.2f}\n")
+        f.write("\nPer-file results:\n")
+        for src, cnt, err in results:
+            f.write(f"- {src} | {cnt} lines{' | ERROR='+err if err else ''}\n")
+
+    print("------------------------------------")
+    print("[DONE] Summary written to:", SUMMARY_PATH)
+    print(f"[DONE] Files: {total_files} | Lines: {total_lines:,} | Chunks: {chunks_created:,}")
+    print(f"[DONE] Elapsed: {elapsed:.1f}s")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[WARN] Interrupted by user. Re-run to continue.")
+        sys.exit(130)
