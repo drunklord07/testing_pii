@@ -11,7 +11,8 @@ from tqdm import tqdm
 INPUT_FOLDER = r"C:\Users\manav\Documents\pii_logs"   # 🔧 Change this to your input folder
 OUTPUT_FOLDER = "output_regex"                        # Fixed name, created in current dir
 SUMMARY_FILE = "summary_report.txt"                   # Saved in current working dir
-MAX_WORKERS = 6                                       # ✅ Use 6–8; 8 by default
+RESUME_LOG = "resume_files.log"                       # ✅ Checkpoint log in current working dir
+MAX_WORKERS = 6                                       # Use 6–8; 8 by default
 # ============================================= #
 
 # ---------- REGEX PATTERNS ----------
@@ -32,7 +33,7 @@ PII_PATTERNS = {
         r'|5[1-5]\d{14}'                                     # Mastercard (old range)
         r'|2(?:2[2-9]\d{12}|[3-6]\d{13}|7(?:[01]\d{12}|20\d{12}))'  # Mastercard 2-series
         r'|3[47]\d{13}'                                      # Amex
-        r'|60\d{14}|65\d{14}|81\d{14}|508\d\d{12}'           # Other BINs in your list
+        r'|60\d{14}|65\d{14}|81\d{14}|508\d\d{12}'           # Other BINs
         r')(?!\d)'
     ),
     "COORD_REGEX": re.compile(
@@ -105,7 +106,8 @@ def extract_matches(log_line: str, per_type_counts: Counter):
 
 def process_file(file_path: str) -> dict:
     """
-    Runs in a separate process. Returns a compact dict with stats for aggregation.
+    Runs in a separate process. Writes to <output>.part then atomically renames.
+    Returns a compact dict with stats for aggregation.
     """
     local = {
         "file_name": os.path.basename(file_path),
@@ -116,18 +118,18 @@ def process_file(file_path: str) -> dict:
         "error": None,
     }
     try:
-        output_file = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))
-        # Large buffered IO for throughput
+        final_out = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))
+        tmp_out = final_out + ".part"
+
+        # Always recreate .part fresh (safe to reprocess a single file if last run died mid-file)
         with open(file_path, "r", encoding="utf-8", errors="ignore", buffering=1024*1024) as f_in, \
-             open(output_file, "w", encoding="utf-8", buffering=1024*1024) as f_out:
+             open(tmp_out, "w", encoding="utf-8", buffering=1024*1024) as f_out:
 
             for raw in f_in:
                 local["lines"] += 1
                 line = raw.rstrip("\n")
 
                 if ";" in line:
-                    # Expecting: log_line ; path
-                    # (be tolerant to spacing)
                     log_line, path = line.rsplit(";", 1)
                     log_line = log_line.rstrip()
                     path = path.strip()
@@ -137,39 +139,63 @@ def process_file(file_path: str) -> dict:
                 matches = extract_matches(log_line, local["per_type_counts"])
                 if matches:
                     for value, pii_type in matches:
-                        # Output format: log_line ; path ;match_value;match_type
                         f_out.write(f"{log_line} ; {path} ;{value};{pii_type}\n")
                         local["written"] += 1
                 else:
                     local["no_match_lines"] += 1
 
-        # If file has 0 lines or 0 written, caller will decide whether to register as blank
+        # Atomic replace -> ensures only completed files appear without ".part"
+        os.replace(tmp_out, final_out)
+
     except Exception as e:
+        # Best-effort cleanup of partial file if any error
+        try:
+            if 'tmp_out' in locals() and os.path.exists(tmp_out):
+                os.remove(tmp_out)
+        except Exception:
+            pass
         local["error"] = f"{local['file_name']}: {e}"
     return local
+
+# ---------- Resume helpers (parent process only) ----------
+def load_completed_set(log_path: str) -> set:
+    completed = set()
+    if os.path.exists(log_path):
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                name = line.strip()
+                if name and not name.startswith("#"):
+                    completed.add(name)
+    return completed
+
+def append_completed(log_path: str, file_name: str):
+    # Append after each successful file to persist progress immediately
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(file_name + "\n")
+        f.flush()  # ensure it’s on disk
 
 def write_summary(input_folder: str):
     with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
         f.write(f"Summary Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Input Folder: {input_folder}\n")
         f.write(f"Output Folder: {os.path.abspath(OUTPUT_FOLDER)}\n\n")
-        f.write(f"Total Files Scanned: {summary['files_scanned']}\n")
-        f.write(f"Total Lines Scanned: {summary['total_lines']}\n")
-        f.write(f"Total PII Matches Found: {summary['total_matches']}\n")
-        f.write(f"Total Output Lines Written: {summary['output_lines_written']}\n")
-        f.write(f"Total Lines with NO_MATCH: {summary['total_no_match_lines']}\n\n")
+        f.write(f"Total Files Scanned (this run): {summary['files_scanned']}\n")
+        f.write(f"Total Lines Scanned (this run): {summary['total_lines']}\n")
+        f.write(f"Total PII Matches Found (this run): {summary['total_matches']}\n")
+        f.write(f"Total Output Lines Written (this run): {summary['output_lines_written']}\n")
+        f.write(f"Total Lines with NO_MATCH (this run): {summary['total_no_match_lines']}\n\n")
 
-        f.write("PII Type Counts:\n")
+        f.write("PII Type Counts (this run):\n")
         for pii_type, count in summary['per_type_counts'].items():
             f.write(f"- {pii_type}: {count}\n")
 
         if summary['blank_files']:
-            f.write("\nFiles with No Matches or Blank:\n")
+            f.write("\nFiles with No Matches or Blank (this run):\n")
             for fname in summary['blank_files']:
                 f.write(f"- {fname}\n")
 
         if summary['errors']:
-            f.write("\nErrors:\n")
+            f.write("\nErrors (this run):\n")
             for err in summary['errors']:
                 f.write(f"- {err}\n")
 
@@ -180,7 +206,7 @@ def main():
 
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-    # Collect .txt files only (as per your new 10k-line chunks)
+    # Gather candidate .txt input files
     all_files = [
         os.path.join(INPUT_FOLDER, f)
         for f in os.listdir(INPUT_FOLDER)
@@ -191,16 +217,34 @@ def main():
         print("No .txt files found in INPUT_FOLDER.", file=sys.stderr)
         sys.exit(2)
 
-    # Submit everything up-front; the pool will keep picking up the next file as soon as a worker is free.
-    # This achieves your “don’t wait; pick up the next one” requirement.
-    overall_bar = tqdm(total=len(all_files), desc="Overall", unit="file", leave=True)
+    # Load resume log & build skip set
+    completed = load_completed_set(RESUME_LOG)
 
-    # On Windows, ProcessPool needs the __main__ guard (present below).
+    # Also treat already-finalized outputs as completed (defensive if log was deleted)
+    for f in list(all_files):
+        out_final = os.path.join(OUTPUT_FOLDER, os.path.basename(f))
+        if os.path.exists(out_final):
+            completed.add(os.path.basename(f))
+
+    # Pending files = not completed yet
+    pending_files = [fp for fp in all_files if os.path.basename(fp) not in completed]
+
+    if not pending_files:
+        print("All files already processed per resume log / outputs. Nothing to do.")
+        # Still write an empty summary for this run
+        write_summary(INPUT_FOLDER)
+        return
+
+    # Kick off pool; as_completed ensures immediate pickup of next task by free workers
+    overall_bar = tqdm(total=len(pending_files), desc="Overall", unit="file", leave=True)
+
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(process_file, fp): fp for fp in all_files}
+        futures = {ex.submit(process_file, fp): fp for fp in pending_files}
 
         for fut in as_completed(futures):
+            src = futures[fut]
             local = fut.result()
+
             summary["files_scanned"] += 1
             summary["total_lines"] += local["lines"]
             summary["total_no_match_lines"] += local["no_match_lines"]
@@ -213,6 +257,9 @@ def main():
 
             if local["error"]:
                 summary["errors"].append(local["error"])
+            else:
+                # ✅ Append to resume log only on success
+                append_completed(RESUME_LOG, os.path.basename(src))
 
             overall_bar.update(1)
 
@@ -221,5 +268,6 @@ def main():
     write_summary(INPUT_FOLDER)
 
 if __name__ == "__main__":
-    # Optionally switch to 6 workers quickly by changing MAX_WORKERS above.
+    # Quick tweak: set MAX_WORKERS = 6 above if you prefer 6.
+    # Delete resume_files.log to force a full re-run from scratch.
     main()
