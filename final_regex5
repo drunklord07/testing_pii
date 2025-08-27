@@ -1,0 +1,359 @@
+import os
+import re
+import sys
+import time
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import lru_cache
+from datetime import datetime
+from tqdm import tqdm
+
+# ====== CONFIGURATION (fully hardcoded) ====== #
+INPUT_FOLDER   = r"C:\Users\manav\Documents\pii_logs"   # 🔧 Change this to your input folder
+OUTPUT_FOLDER  = "output_regex"                         # Created in current dir if missing
+SUMMARY_FILE   = "summary_regex.txt"                    # Single summary in current dir
+RESUME_LOG     = "resume_regex.log"                     # Single resume log in current dir
+MAX_WORKERS    = 6                                      # Use 6–8; set 6 by default
+# ============================================= #
+
+# ---------- REGEX PATTERNS ----------
+PII_PATTERNS = {
+    "MOBILE_REGEX": re.compile(r'(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])'),
+    "AADHAAR_REGEX": re.compile(r'(?<![A-Za-z0-9])(\d{12})(?![A-Za-z0-9])'),
+    "PAN_REGEX": re.compile(r'(?<![A-Za-z0-9])[A-Z]{5}\d{4}[A-Z](?![A-Za-z0-9])', re.IGNORECASE),
+    "GSTIN_REGEX": re.compile(r'(?<![A-Za-z0-9])\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z](?![A-Za-z0-9])', re.IGNORECASE),
+    "DL_REGEX": re.compile(r'(?<![A-Za-z0-9])[A-Z]{2}\d{2}\d{11}(?![A-Za-z0-9])', re.IGNORECASE),
+    "VOTERID_REGEX": re.compile(r'(?<![A-Za-z0-9])[A-Z]{3}\d{7}(?![A-Za-z0-9])', re.IGNORECASE),
+    "EMAIL_REGEX": re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', re.IGNORECASE),
+    "UPI_REGEX": re.compile(r'[A-Za-z0-9.\-_]{2,256}@[A-Za-z]{2,64}'),
+    "IP_REGEX": re.compile(r'(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)'),
+    "MAC_REGEX": re.compile(r'(?<![A-Fa-f0-9])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![A-Fa-f0-9])'),
+    "CARD_REGEX": re.compile(
+        r'(?<!\d)('
+        r'4\d{12}(?:\d{3})?'                                 # Visa
+        r'|5[1-5]\d{14}'                                     # Mastercard (old range)
+        r'|2(?:2[2-9]\d{12}|[3-6]\d{13}|7(?:[01]\d{12}|20\d{12}))'  # Mastercard 2-series
+        r'|3[47]\d{13}'                                      # Amex
+        r'|60\d{14}|65\d{14}|81\d{14}|508\d\d{12}'           # Other BINs you included
+        r')(?!\d)'
+    ),
+    "COORD_REGEX": re.compile(
+        r'(?<![A-Za-z0-9])'
+        r'([+-]?(?:90(?:\.0+)?|[0-8]?\d(?:\.\d+)?))'
+        r'\s*,\s*'
+        r'([+-]?(?:180(?:\.0+)?|1[0-7]\d(?:\.\d+)?|[0-9]?\d(?:\.\d+)?))'
+        r'(?![A-Za-z0-9])'
+    ),
+}
+
+# ---------- SUMMARY (aggregated in parent) ----------
+summary = {
+    # Discovery
+    "files_found": 0,
+    "already_completed": [],      # from resume log (present in INPUT_FOLDER)
+    # Processing (this run)
+    "files_scanned": 0,
+    "files_success": 0,
+    "files_error": 0,
+    "files_blank": [],            # processed but wrote 0 lines
+    "processed_files": [],        # success filenames
+    "errors": [],                 # "file: reason"
+    # Counters
+    "total_lines": 0,
+    "total_no_match_lines": 0,
+    "output_lines_written": 0,    # equals number of matches written
+    "per_type_counts": Counter({k: 0 for k in PII_PATTERNS}),
+    # Timing & config
+    "start_ts": None,
+    "end_ts": None,
+    "max_workers": MAX_WORKERS,
+}
+
+# ---------- Aadhaar Verhoeff ----------
+@lru_cache(maxsize=10000)
+def is_valid_aadhaar(number: str) -> bool:
+    if len(number) != 12 or not number.isdigit():
+        return False
+    mul = [
+        [0,1,2,3,4,5,6,7,8,9],
+        [1,2,3,4,0,6,7,8,9,5],
+        [2,3,4,0,1,7,8,9,5,6],
+        [3,4,0,1,2,8,9,5,6,7],
+        [4,0,1,2,3,9,5,6,7,8],
+        [5,9,8,7,6,0,4,3,2,1],
+        [6,5,9,8,7,1,0,4,3,2],
+        [7,6,5,9,8,2,1,0,4,3],
+        [8,7,6,5,9,3,2,1,0,4],
+        [9,8,7,6,5,4,3,2,1,0]
+    ]
+    perm = [
+        [0,1,2,3,4,5,6,7,8,9],
+        [1,5,7,6,2,8,3,0,9,4],
+        [5,8,0,3,7,9,6,1,4,2],
+        [8,9,1,6,0,4,3,5,2,7],
+        [9,4,5,3,1,2,6,8,7,0],
+        [4,2,8,6,5,7,3,9,0,1],
+        [2,7,9,3,8,0,6,4,1,5],
+        [7,0,4,6,9,1,3,2,5,8]
+    ]
+    inv = [0,4,3,2,1,5,6,7,8,9]
+    c = 0
+    for i, ch in enumerate(reversed(number)):
+        c = mul[c][perm[i % 8][int(ch)]]
+    return inv[c] == 0
+
+# ---------- Core matching ----------
+def extract_matches(log_line: str, per_type_counts: Counter):
+    matches = []
+    for pii_type, pattern in PII_PATTERNS.items():
+        if not pattern.search(log_line):
+            continue
+        for m in pattern.finditer(log_line):
+            value = m.group(0)
+            if pii_type == "AADHAAR_REGEX" and not is_valid_aadhaar(value):
+                continue
+            matches.append((value, pii_type))
+            per_type_counts[pii_type] += 1
+    return matches
+
+def process_file(file_path: str) -> dict:
+    """
+    Runs in a separate process.
+    Writes directly to final output (overwrite). If the run is interrupted, the file
+    will be reprocessed on the next run (not logged as completed).
+    Returns compact stats for aggregation.
+    """
+    local = {
+        "file_name": os.path.basename(file_path),
+        "lines": 0,
+        "no_match_lines": 0,
+        "written": 0,
+        "per_type_counts": Counter({k: 0 for k in PII_PATTERNS}),
+        "error": None,
+    }
+    out_path = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore", buffering=1024*1024) as f_in, \
+             open(out_path,  "w", encoding="utf-8", buffering=1024*1024) as f_out:
+
+            for raw in f_in:
+                local["lines"] += 1
+                line = raw.rstrip("\n")
+
+                if ";" in line:
+                    log_line, path = line.rsplit(";", 1)
+                    log_line = log_line.rstrip()
+                    path = path.strip()
+                else:
+                    log_line, path = line, "UNKNOWN_PATH"
+
+                matches = extract_matches(log_line, local["per_type_counts"])
+                if matches:
+                    for value, pii_type in matches:
+                        # Output format: log_line ; path ;match_value;match_type
+                        f_out.write(f"{log_line} ; {path} ;{value};{pii_type}\n")
+                        local["written"] += 1
+                else:
+                    local["no_match_lines"] += 1
+
+    except Exception as e:
+        # Best-effort cleanup: if we failed mid-file due to an exception in this worker,
+        # remove partial output to avoid confusing inspection between runs.
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+        local["error"] = f"{local['file_name']}: {e}"
+    return local
+
+# ---------- Resume helpers (parent process only) ----------
+def load_completed_set(log_path: str) -> set:
+    completed = set()
+    if os.path.exists(log_path):
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                name = line.strip()
+                if name and not name.startswith("#"):
+                    completed.add(name)
+    return completed
+
+def append_completed(log_path: str, file_name: str):
+    # Append after each successful file to persist progress immediately
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(file_name + "\n")
+        f.flush()
+
+def write_summary(input_folder: str, all_files, pending_files, initial_completed_set: set):
+    # Compute totals
+    total_matches = sum(summary["per_type_counts"].values())
+    summary["end_ts"] = time.time()
+
+    start_dt = datetime.fromtimestamp(summary["start_ts"]) if summary["start_ts"] else None
+    end_dt   = datetime.fromtimestamp(summary["end_ts"]) if summary["end_ts"] else None
+    duration = (summary["end_ts"] - summary["start_ts"]) if (summary["start_ts"] and summary["end_ts"]) else None
+
+    # Derive lists for reporting
+    already_completed_list = sorted(
+        [os.path.basename(fp) for fp in all_files if os.path.basename(fp) in initial_completed_set]
+    )
+    processed_success_list = sorted(summary["processed_files"])
+    blank_list             = sorted(summary["files_blank"])
+    error_list             = sorted(summary["errors"])
+
+    with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
+        f.write(f"Summary Report (Regex Scan) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write("=== Run Configuration ===\n")
+        f.write(f"Input Folder: {input_folder}\n")
+        f.write(f"Output Folder: {os.path.abspath(OUTPUT_FOLDER)}\n")
+        f.write(f"Max Workers: {summary['max_workers']}\n\n")
+
+        f.write("=== Timing ===\n")
+        f.write(f"Start: {start_dt}\n")
+        f.write(f"End:   {end_dt}\n")
+        f.write(f"Duration (sec): {duration}\n\n")
+
+        f.write("=== File Discovery ===\n")
+        f.write(f"Total .txt files found: {summary['files_found']}\n")
+        f.write(f"Already completed per resume log (skipped this run): {len(already_completed_list)}\n")
+        f.write(f"Pending at start of run: {len(pending_files)}\n\n")
+
+        f.write("=== Processing (this run) ===\n")
+        f.write(f"Files processed: {summary['files_scanned']}\n")
+        f.write(f" - Success: {summary['files_success']}\n")
+        f.write(f" - Errors:  {summary['files_error']}\n")
+        f.write(f" - Blank (0 matches): {len(blank_list)}\n\n")
+
+        f.write("=== Totals (this run) ===\n")
+        f.write(f"Total Lines Scanned: {summary['total_lines']}\n")
+        f.write(f"Total Lines with NO_MATCH: {summary['total_no_match_lines']}\n")
+        f.write(f"Total Output Lines Written: {summary['output_lines_written']}\n")
+        f.write(f"Total PII Matches Found: {total_matches}\n\n")
+
+        f.write("=== PII Type Counts (this run) ===\n")
+        for pii_type, count in sorted(summary['per_type_counts'].items()):
+            f.write(f"- {pii_type}: {count}\n")
+        f.write("\n")
+
+        # Lists (full, in this single summary file)
+        f.write("=== Skipped (already completed per resume log) ===\n")
+        if already_completed_list:
+            for name in already_completed_list:
+                f.write(name + "\n")
+        else:
+            f.write("(none)\n")
+        f.write("\n")
+
+        f.write("=== Processed Successfully (this run) ===\n")
+        if processed_success_list:
+            for name in processed_success_list:
+                f.write(name + "\n")
+        else:
+            f.write("(none)\n")
+        f.write("\n")
+
+        f.write("=== Blank Files (0 matches written) (this run) ===\n")
+        if blank_list:
+            for name in blank_list:
+                f.write(name + "\n")
+        else:
+            f.write("(none)\n")
+        f.write("\n")
+
+        f.write("=== Error Files (this run) ===\n")
+        if error_list:
+            for msg in error_list:
+                f.write(msg + "\n")   # already "filename: reason"
+        else:
+            f.write("(none)\n")
+        f.write("\n")
+
+        # Cumulative to date snapshot (optional, derived)
+        completed_to_date = set(already_completed_list) | set(processed_success_list)
+        f.write("=== Cumulative (to date, based on resume log + this run) ===\n")
+        f.write(f"Total completed files to date: {len(completed_to_date)} / {summary['files_found']}\n")
+
+def main():
+    if not os.path.isdir(INPUT_FOLDER):
+        print(f"ERROR: INPUT_FOLDER does not exist: {INPUT_FOLDER}", file=sys.stderr)
+        sys.exit(1)
+
+    summary["start_ts"] = time.time()
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+    # Discover .txt files (stable ordering)
+    all_files = sorted(
+        os.path.join(INPUT_FOLDER, f)
+        for f in os.listdir(INPUT_FOLDER)
+        if f.endswith(".txt") and os.path.isfile(os.path.join(INPUT_FOLDER, f))
+    )
+    summary["files_found"] = len(all_files)
+
+    if not all_files:
+        # Even if nothing to do, write an empty (but valid) summary
+        write_summary(INPUT_FOLDER, [], [], set())
+        print("No .txt files found in INPUT_FOLDER.", file=sys.stderr)
+        return
+
+    # Load resume set (filenames that previously completed successfully)
+    initial_completed_set = load_completed_set(RESUME_LOG)
+
+    # Build pending list (only rely on resume log; ignore presence of outputs)
+    pending_files = [fp for fp in all_files if os.path.basename(fp) not in initial_completed_set]
+    summary["already_completed"] = sorted(
+        [os.path.basename(fp) for fp in all_files if os.path.basename(fp) in initial_completed_set]
+    )
+
+    if not pending_files:
+        # All done previously
+        write_summary(INPUT_FOLDER, all_files, pending_files, initial_completed_set)
+        print("All files already processed per resume log. Nothing to do.")
+        return
+
+    # Process pool; workers keep picking new files as they finish (as_completed)
+    overall_bar = tqdm(total=len(pending_files), desc="Overall", unit="file", leave=True)
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(process_file, fp): fp for fp in pending_files}
+
+        for fut in as_completed(futures):
+            src  = futures[fut]
+            base = os.path.basename(src)
+
+            try:
+                local = fut.result()
+            except Exception as e:
+                # Worker crashed before returning local dict
+                msg = f"{base}: worker exception: {e}"
+                summary["errors"].append(msg)
+                summary["files_scanned"] += 1
+                summary["files_error"] += 1
+                overall_bar.update(1)
+                continue
+
+            summary["files_scanned"]       += 1
+            summary["total_lines"]         += local["lines"]
+            summary["total_no_match_lines"]+= local["no_match_lines"]
+            summary["output_lines_written"]+= local["written"]
+            summary["per_type_counts"].update(local["per_type_counts"])
+
+            if local["error"]:
+                summary["errors"].append(local["error"])
+                summary["files_error"] += 1
+            else:
+                summary["files_success"] += 1
+                summary["processed_files"].append(base)
+                if local["written"] == 0:
+                    summary["files_blank"].append(base)
+                # ✅ Append to resume log only on success
+                append_completed(RESUME_LOG, base)
+
+            overall_bar.update(1)
+
+    overall_bar.close()
+
+    # Finalize and write summary
+    write_summary(INPUT_FOLDER, all_files, pending_files, initial_completed_set)
+
+if __name__ == "__main__":
+    # To force a complete re-run, delete resume_regex.log (and/or the output files if you wish).
+    main()
