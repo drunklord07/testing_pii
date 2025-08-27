@@ -1,217 +1,42 @@
-#!/usr/bin/env python3
-# system_check.py
+# system_check_simple.py
 import os
-import sys
-import json
-import shutil
-import subprocess
-from typing import List, Dict
-
-# Try to use psutil for accurate CPU/RAM/Disk usage.
-try:
-    import psutil
-except ImportError:
-    psutil = None
+import psutil
 
 def human_gb(n_bytes: int) -> str:
     return f"{n_bytes / (1024**3):.2f} GB"
 
-def get_cpu_info() -> Dict[str, str]:
-    info = {}
-    # Cores/threads
-    if psutil:
-        info["physical_cores"] = psutil.cpu_count(logical=False) or 0
-        info["logical_processors"] = psutil.cpu_count(logical=True) or 0
-        # Live CPU utilization sampled over ~1s
-        info["cpu_percent_now"] = f"{psutil.cpu_percent(interval=1):.1f}%"
-    else:
-        info["physical_cores"] = os.cpu_count() or 0
-        info["logical_processors"] = os.cpu_count() or 0
-        info["cpu_percent_now"] = "psutil not installed"
-    return info
-
-def get_ram_info() -> Dict[str, str]:
-    if not psutil:
-        return {
-            "total": "psutil required",
-            "used": "psutil required",
-            "free": "psutil required",
-            "percent": "psutil required",
-        }
-    vm = psutil.virtual_memory()
-    return {
-        "total": human_gb(vm.total),
-        "used": human_gb(vm.used),
-        "free": human_gb(vm.available),
-        "percent": f"{vm.percent:.1f}%",
-    }
-
-def get_drive_usage() -> List[Dict[str, str]]:
-    """Per logical drive (C:, D:, …) show usage."""
-    drives = []
-    if not psutil:
-        # Fallback: cmd 'wmic logicaldisk' (bytes only, no % used)
-        try:
-            out = subprocess.check_output(
-                ["wmic", "logicaldisk", "get", "Name,Size,FreeSpace"],
-                stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="ignore"
-            )
-            lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()][1:]
-            for ln in lines:
-                parts = ln.split()
-                if len(parts) >= 3:
-                    name, free, size = parts[0], parts[1], parts[2]
-                    try:
-                        free_i = int(free)
-                        size_i = int(size)
-                        used_i = max(size_i - free_i, 0)
-                        pct = f"{(used_i/size_i*100):.1f}%" if size_i > 0 else "0.0%"
-                    except:
-                        free_i = size_i = used_i = 0
-                        pct = "N/A"
-                    drives.append({
-                        "drive": name,
-                        "total": human_gb(size_i),
-                        "used": human_gb(used_i),
-                        "free": human_gb(free_i),
-                        "percent": pct
-                    })
-        except Exception:
-            pass
-        return drives
-
-    # psutil path (more accurate & robust)
-    for p in psutil.disk_partitions(all=False):
-        # Skip non-fixed drives (cdrom/remote) if desired
-        if os.name == "nt":
-            if "cdrom" in p.opts or p.fstype == "":
-                continue
-        try:
-            usage = psutil.disk_usage(p.mountpoint)
-        except PermissionError:
-            continue
-        drives.append({
-            "drive": p.device.rstrip("\\"),
-            "total": human_gb(usage.total),
-            "used": human_gb(usage.used),
-            "free": human_gb(usage.free),
-            "percent": f"{usage.percent:.1f}%"
-        })
-    return drives
-
-def get_physical_disks() -> List[Dict[str, str]]:
-    """
-    Uses PowerShell to read physical disks and their MediaType (SSD/HDD/Unspecified).
-    This does NOT map to drive letters (C:/D:)—it lists the actual devices.
-    """
-    ps_cmd = [
-        "powershell",
-        "-NoProfile",
-        "-Command",
-        # Convert to JSON so we can parse reliably
-        "Get-PhysicalDisk | Select-Object FriendlyName,MediaType,Size | ConvertTo-Json -Depth 2"
-    ]
-    try:
-        out = subprocess.check_output(ps_cmd, stderr=subprocess.DEVNULL)
-        text = out.decode("utf-8", errors="ignore").strip()
-        if not text:
-            return []
-        data = json.loads(text)
-        if isinstance(data, dict):
-            data = [data]
-        disks = []
-        for d in data:
-            size = d.get("Size", 0)
-            disks.append({
-                "name": d.get("FriendlyName", "Unknown"),
-                "type": d.get("MediaType", "Unspecified"),
-                "size": human_gb(int(size) if isinstance(size, int) else 0)
-            })
-        return disks
-    except Exception:
-        # Fallback to wmic (doesn't expose SSD/HDD cleanly, but we try)
-        try:
-            out = subprocess.check_output(
-                ["wmic", "diskdrive", "get", "Model,Size,MediaType"],
-                stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="ignore"
-            )
-            lines = [ln for ln in out.splitlines() if ln.strip()]
-            headers = lines[0]
-            rows = lines[1:]
-            disks = []
-            for r in rows:
-                # Best-effort split; WMIC columns are fixed-width
-                parts = r.split()
-                # Join middle into model text; last token is size (if numeric)
-                if not parts:
-                    continue
-                # Try to grab size from the last numeric token
-                size_i = 0
-                for tok in reversed(parts):
-                    if tok.isdigit():
-                        size_i = int(tok)
-                        break
-                model = r.replace(str(size_i), "").strip() if size_i else r.strip()
-                disks.append({
-                    "name": model,
-                    "type": "Unknown",
-                    "size": human_gb(size_i)
-                })
-            return disks
-        except Exception:
-            return []
-
-def print_section(title: str):
-    print("\n" + title)
-    print("-" * len(title))
-
 def main():
-    # Basic environment sanity
-    if os.name != "nt":
-        print("This script is tailored for Windows. Some outputs may be unavailable.")
-    # Header
     print("System Capability & Usage Summary")
     print("=================================")
 
     # CPU
-    cpu = get_cpu_info()
-    print_section("CPU")
-    print(f"Physical cores         : {cpu.get('physical_cores')}")
-    print(f"Logical processors     : {cpu.get('logical_processors')}")
-    print(f"CPU utilization (now)  : {cpu.get('cpu_percent_now')}")
+    print("\nCPU")
+    print("---")
+    print(f"Physical cores     : {psutil.cpu_count(logical=False)}")
+    print(f"Logical processors : {psutil.cpu_count(logical=True)}")
+    print(f"CPU utilization    : {psutil.cpu_percent(interval=1):.1f}%")
 
     # RAM
-    print_section("Memory (RAM)")
-    ram = get_ram_info()
-    print(f"Total                  : {ram['total']}")
-    print(f"Used                   : {ram['used']}")
-    print(f"Free/Available         : {ram['free']}")
-    print(f"Utilization            : {ram['percent']}")
+    print("\nMemory (RAM)")
+    print("-------------")
+    vm = psutil.virtual_memory()
+    print(f"Total : {human_gb(vm.total)}")
+    print(f"Used  : {human_gb(vm.used)}")
+    print(f"Free  : {human_gb(vm.available)}")
+    print(f"Usage : {vm.percent:.1f}%")
 
-    # Disks (logical drives)
-    print_section("Logical Drives (per drive usage)")
-    drives = get_drive_usage()
-    if not drives:
-        print("No drives detected or permissions issue.")
-    else:
-        for d in drives:
-            print(f"{d['drive']:>3}  Total: {d['total']:>9}  Used: {d['used']:>9}  Free: {d['free']:>9}  Used%: {d['percent']:>6}")
-
-    # Physical disks (media type)
-    print_section("Physical Disks (device type)")
-    pdisks = get_physical_disks()
-    if not pdisks:
-        print("Could not determine disk types (SSD/HDD). PowerShell may be restricted.")
-    else:
-        for i, d in enumerate(pdisks, 1):
-            print(f"Disk {i}: {d['name']}  |  Type: {d['type']}  |  Size: {d['size']}")
-
-    # Hints if psutil missing
-    if psutil is None:
-        print_section("Note")
-        print("For full CPU/RAM/live disk usage, install psutil:")
-        print("  python -m pip install psutil")
-        print("Then re-run: python system_check.py")
+    # Disks
+    print("\nLogical Drives")
+    print("--------------")
+    for part in psutil.disk_partitions(all=False):
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+        except PermissionError:
+            continue
+        print(f"{part.device}  Total: {human_gb(usage.total):>9}  "
+              f"Used: {human_gb(usage.used):>9}  "
+              f"Free: {human_gb(usage.free):>9}  "
+              f"Used%: {usage.percent:>5.1f}%")
 
 if __name__ == "__main__":
     main()
