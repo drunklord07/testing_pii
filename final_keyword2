@@ -1,0 +1,344 @@
+import os
+import re
+import sys
+import time
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
+from tqdm import tqdm
+
+# ====== CONFIGURATION (fully hardcoded) ====== #
+INPUT_FOLDER = r"C:\Users\manav\Documents\pii_logs"   # 🔧 Change this to your input folder
+OUTPUT_FOLDER = "output_regex"                        # Fixed name, created in current dir
+SUMMARY_FILE = "summary_report.txt"                   # Saved in current working dir
+RESUME_LOG = "resume_files.log"                       # ✅ Checkpoint log in current working dir
+MAX_WORKERS = 6                                       # Use 6–8; 8 by default
+SUMMARY_EVERY_SECS = 30                               # ⏱️ periodic summary flush
+# ============================================= #
+
+# ---------- KEYWORD PHRASES ----------
+KEYWORD_PHRASES = {
+    "ADDRESS_KEYWORD": [
+        "address",
+        "full address",
+        "complete address",
+        "residential address",
+        "permanent address",
+        "add",
+    ],
+    "NAME_KEYWORD": [
+        "name",
+        "nam",
+    ],
+    "DOB_KEYWORD": [
+        "date of birth",
+        "dob",
+        "birthdate",
+        "born on",
+    ],
+    "ACCOUNT_NUMBER_KEYWORD": [
+        "account number",
+        "acc number",
+        "bank account",
+        "account no",
+        "a/c no",
+    ],
+    "CUSTOMER_ID_KEYWORD": [
+        "customer id",
+        "cust id",
+        "customer number",
+        "cust",
+    ],
+    "SENSITIVE_HINTS_KEYWORD": [
+        "national id",
+        "identity card",
+        "proof of identity",
+        "document number",
+    ],
+    "INSURANCE_POLICY_KEYWORD": [
+        "insurance number",
+        "policy number",
+        "insurance id",
+        "ins id",
+    ],
+}
+
+# ---------- REGEX COMPILATION HELPERS ----------
+# Allow flexible separators INSIDE multi-word phrases: spaces or _ or - (with optional spaces).
+SEP = r"[ \t]*[-_][ \t]*|[ \t]+"          # hyphen/underscore (optional spaces) OR spaces
+SEP_GROUP = f"(?:{SEP})"
+
+def build_phrase_alt(phrase: str) -> str:
+    tokens = [re.escape(tok) for tok in phrase.split()]
+    if len(tokens) == 1:
+        return tokens[0]
+    separated = SEP_GROUP.join(tokens)     # date[sep]of[sep]birth
+    contiguous = "".join(tokens)           # dateofbirth (camelCase allowed by IGNORECASE)
+    return f"(?:{separated}|{contiguous})"
+
+def compile_keyword_patterns():
+    patterns = {}
+    core_map = {}
+    for ktype, phrases in KEYWORD_PHRASES.items():
+        alts = [build_phrase_alt(p) for p in phrases]
+        core = "|".join(alts)
+        core_map[ktype] = core
+        # Patch 1: strict boundaries on BOTH sides: not a letter/digit adjacent
+        pat = re.compile(rf"(?<![A-Za-z0-9])(?:{core})(?![A-Za-z0-9])", re.IGNORECASE)
+        patterns[ktype] = pat
+    return patterns
+
+KEYWORD_PATTERNS = compile_keyword_patterns()
+
+# ---------- SUMMARY (aggregated in parent) ----------
+summary = {
+    # discovery & resume
+    "files_found": 0,
+    "skipped_files": [],
+    # per-run processing
+    "files_scanned": 0,
+    "files_success": 0,
+    "files_error": 0,
+    "blank_input_files": [],     # input file had 0 lines
+    "zero_match_files": [],      # file had lines but produced 0 output lines
+    "errors": [],                # "file: reason"
+    # counters
+    "total_lines": 0,            # total input lines scanned
+    "lines_kept": 0,             # output lines written (lines with ≥1 keyword)
+    "total_no_match_lines": 0,   # total_lines - lines_kept
+    "per_type_counts": Counter({k: 0 for k in KEYWORD_PATTERNS}),  # unique per line
+    # timing/config
+    "start_ts": None,
+    "end_ts": None,
+    "max_workers": MAX_WORKERS,
+}
+
+# ---------- Core matching (unique per line) ----------
+def extract_keyword_types(log_line: str, per_type_counts: Counter):
+    """
+    Returns a sorted list of UNIQUE keyword types matched in this line.
+    Per-type counts are incremented at most once per type per line.
+    """
+    matched_types = []
+    for ktype, pattern in KEYWORD_PATTERNS.items():
+        if pattern.search(log_line):
+            matched_types.append(ktype)
+    # unique + stable order
+    matched_types = sorted(set(matched_types))
+    for k in matched_types:
+        per_type_counts[k] += 1
+    return matched_types
+
+def process_file(file_path: str) -> dict:
+    """
+    Runs in a separate process. Writes directly to final output (overwrite).
+    On error, partial output is removed so the file is retried on next run.
+    Output format (one line per input line that matched at least one type):
+        original_log_line ; path ; TYPE1;TYPE2;TYPE3
+    """
+    local = {
+        "file_name": os.path.basename(file_path),
+        "lines": 0,
+        "lines_kept": 0,
+        "no_match_lines": 0,
+        "per_type_counts": Counter({k: 0 for k in KEYWORD_PATTERNS}),
+        "error": None,
+        "input_was_blank": False,
+    }
+    out_path = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore", buffering=1024*1024) as f_in, \
+             open(out_path,  "w", encoding="utf-8", buffering=1024*1024) as f_out:
+
+            any_line = False
+            for raw in f_in:
+                any_line = True
+                local["lines"] += 1
+                line = raw.rstrip("\n")
+
+                if ";" in line:
+                    log_line, path = line.rsplit(";", 1)
+                    log_line = log_line.rstrip()
+                    path = path.strip()
+                else:
+                    log_line, path = line, "UNKNOWN_PATH"
+
+                types = extract_keyword_types(log_line, local["per_type_counts"])
+                if types:
+                    # one output line per input line with >=1 match; types joined by ';'
+                    f_out.write(f"{log_line} ; {path} ;" + ";".join(types) + "\n")
+                    local["lines_kept"] += 1
+                else:
+                    local["no_match_lines"] += 1
+
+            if not any_line:
+                local["input_was_blank"] = True
+                # still create an empty output file (we already opened it)
+
+    except Exception as e:
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+        local["error"] = f"{local['file_name']}: {e}"
+    return local
+
+# ---------- Resume helpers ----------
+def load_completed_set(log_path: str) -> set:
+    completed = set()
+    if os.path.exists(log_path):
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                name = line.strip()
+                if name and not name.startswith("#"):
+                    completed.add(name)
+    return completed
+
+def append_completed(log_path: str, file_name: str):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(file_name + "\n")
+        f.flush()
+
+# ---------- Summary writer ----------
+def write_summary(input_folder: str, all_files=None, pending_files=None, completed_set=None):
+    summary["end_ts"] = time.time()
+    # recompute totals
+    summary["total_no_match_lines"] = summary["total_lines"] - summary["lines_kept"]
+
+    with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
+        f.write(f"Summary Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Input Folder: {input_folder}\n")
+        f.write(f"Output Folder: {os.path.abspath(OUTPUT_FOLDER)}\n")
+        f.write(f"Max Workers: {summary['max_workers']}\n\n")
+
+        if all_files is not None and pending_files is not None and completed_set is not None:
+            skipped = sorted([os.path.basename(fp) for fp in all_files if os.path.basename(fp) in completed_set])
+            summary["skipped_files"] = skipped
+            f.write("=== File Discovery ===\n")
+            f.write(f"Total .txt files found: {len(all_files)}\n")
+            f.write(f"Already completed (skipped this run): {len(skipped)}\n")
+            f.write(f"Pending at start of run: {len(pending_files)}\n\n")
+
+        f.write("=== Processing (this run) ===\n")
+        f.write(f"Files processed: {summary['files_scanned']}\n")
+        f.write(f" - Success: {summary['files_success']}\n")
+        f.write(f" - Errors:  {summary['files_error']}\n")
+        f.write(f" - Blank input files: {len(summary['blank_input_files'])}\n")
+        f.write(f" - Files with 0 matches (non-blank input): {len(summary['zero_match_files'])}\n\n")
+
+        f.write("=== Line Counts (this run) ===\n")
+        f.write(f"Total Lines Scanned: {summary['total_lines']}\n")
+        f.write(f"Lines Kept (≥1 match): {summary['lines_kept']}\n")
+        f.write(f"Lines Removed (no match): {summary['total_no_match_lines']}\n\n")
+
+        f.write("=== Per-Keyword-Type Counts (unique per line) ===\n")
+        for ktype, count in sorted(summary['per_type_counts'].items()):
+            f.write(f"- {ktype}: {count}\n")
+
+        if summary['skipped_files']:
+            f.write("\n=== Skipped Files (already completed) ===\n")
+            for fname in summary['skipped_files']:
+                f.write(f"- {fname}\n")
+
+        if summary['blank_input_files']:
+            f.write("\n=== Blank Input Files (0 lines) ===\n")
+            for fname in sorted(summary['blank_input_files']):
+                f.write(f"- {fname}\n")
+
+        if summary['zero_match_files']:
+            f.write("\n=== Files With 0 Matches (had lines) ===\n")
+            for fname in sorted(summary['zero_match_files']):
+                f.write(f"- {fname}\n")
+
+        if summary['errors']:
+            f.write("\n=== Errors (this run) ===\n")
+            for err in summary['errors']:
+                f.write(f"- {err}\n")
+
+# ---------- Main ----------
+def main():
+    if not os.path.isdir(INPUT_FOLDER):
+        print(f"ERROR: INPUT_FOLDER does not exist: {INPUT_FOLDER}", file=sys.stderr)
+        sys.exit(1)
+
+    summary["start_ts"] = time.time()
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+    # Discover inputs (stable order)
+    all_files = sorted(
+        os.path.join(INPUT_FOLDER, f)
+        for f in os.listdir(INPUT_FOLDER)
+        if f.endswith(".txt") and os.path.isfile(os.path.join(INPUT_FOLDER, f))
+    )
+    summary["files_found"] = len(all_files)
+
+    if not all_files:
+        print("No .txt files found in INPUT_FOLDER.", file=sys.stderr)
+        write_summary(INPUT_FOLDER, [], [], set())
+        sys.exit(2)
+
+    completed = load_completed_set(RESUME_LOG)
+    pending_files = [fp for fp in all_files if os.path.basename(fp) not in completed]
+
+    if not pending_files:
+        print("All files already processed per resume log. Nothing to do.")
+        write_summary(INPUT_FOLDER, all_files, pending_files, completed)
+        return
+
+    # Prime summary with discovery info
+    write_summary(INPUT_FOLDER, all_files, pending_files, completed)
+
+    overall_bar = tqdm(total=len(pending_files), desc="Overall", unit="file", leave=True)
+    last_summary_write = time.time()
+
+    try:
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(process_file, fp): fp for fp in pending_files}
+
+            for fut in as_completed(futures):
+                src = futures[fut]
+                base = os.path.basename(src)
+
+                try:
+                    local = fut.result()
+                except Exception as e:
+                    summary["files_scanned"] += 1
+                    summary["files_error"] += 1
+                    summary["errors"].append(f"{base}: worker exception: {e}")
+                    overall_bar.update(1)
+                    if time.time() - last_summary_write >= SUMMARY_EVERY_SECS:
+                        write_summary(INPUT_FOLDER, all_files, pending_files, completed)
+                        last_summary_write = time.time()
+                    continue
+
+                summary["files_scanned"] += 1
+                summary["total_lines"] += local["lines"]
+                summary["lines_kept"] += local["lines_kept"]
+                summary["per_type_counts"].update(local["per_type_counts"])
+
+                if local["input_was_blank"]:
+                    summary["blank_input_files"].append(local["file_name"])
+
+                if local["lines"] > 0 and local["lines_kept"] == 0:
+                    summary["zero_match_files"].append(local["file_name"])
+
+                if local["error"]:
+                    summary["files_error"] += 1
+                    summary["errors"].append(local["error"])
+                else:
+                    summary["files_success"] += 1
+                    append_completed(RESUME_LOG, base)
+
+                overall_bar.update(1)
+
+                if time.time() - last_summary_write >= SUMMARY_EVERY_SECS:
+                    write_summary(INPUT_FOLDER, all_files, pending_files, completed)
+                    last_summary_write = time.time()
+
+    finally:
+        overall_bar.close()
+        write_summary(INPUT_FOLDER, all_files, pending_files, completed)
+
+if __name__ == "__main__":
+    main()
